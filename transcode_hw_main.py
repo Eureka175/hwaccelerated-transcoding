@@ -17,13 +17,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, OrderedDict
 
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
 STOP_EVENT = threading.Event()
 ACTIVE_PROCS_LOCK = threading.Lock()
 ACTIVE_PROCS = set()
-
-=======
->>>>>>> main
 # ---------------- presets ----------------
 PRESETS_INFO = OrderedDict([
     ("preset1", {"name":"4k_prog_archive_1pass", "desc":"HEVC NVENC@P7, 1pass, vbr_hq(30/40), main10 p010, aq+lookahead"}),
@@ -113,8 +109,6 @@ def append_csv(path: Path, headers, row):
 def human_bitrate(mbps):
     return f"{int(mbps)}M" if mbps is not None else None
 
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
-
 def suggest_bitrate_range(width, height):
     """Suggest bitrate by long side to avoid portrait/rotated misclassification."""
     candidates = [x for x in (width, height) if isinstance(x, (int, float))]
@@ -124,9 +118,6 @@ def suggest_bitrate_range(width, height):
     if long_side and long_side >= 1920:
         return (10, 20)
     return (5, 10)
-
-=======
->>>>>>> main
 # ---------------- query encoder ----------------
 def query_encoder(backend: str, work: Path):
     mapping = {"nvenc":["h264_nvenc","hevc_nvenc"], "qsv":["h264_qsv","hevc_qsv"], "amf":["h264_amf","hevc_amf"]}
@@ -295,42 +286,31 @@ def make_output_path(src: Path, src_root: Path, dst_root: Path, flat_output=Fals
 
 # ---------------- execution ----------------
 def _run_and_log(cmd, logp: Path, timeout=None):
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
     if STOP_EVENT.is_set():
         return 130, "interrupted", 0.0
     start = time.time()
     p = None
-=======
-    start = time.time()
->>>>>>> main
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except FileNotFoundError:
         logp.parent.mkdir(parents=True, exist_ok=True)
         logp.write_text("ffmpeg not found\n", encoding='utf-8')
         return 127, "ffmpeg-not-found", 0.0
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
     with ACTIVE_PROCS_LOCK:
         ACTIVE_PROCS.add(p)
-=======
->>>>>>> main
     logp.parent.mkdir(parents=True, exist_ok=True)
     with logp.open("wb") as f:
         try:
             for chunk in p.stdout:
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
                 if STOP_EVENT.is_set():
                     p.kill()
                     return 130, "interrupted", round(time.time()-start,1)
-=======
->>>>>>> main
                 if chunk is None: continue
                 f.write(chunk)
             p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             p.kill()
             return -9, "timeout", round(time.time()-start,1)
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
         finally:
             with ACTIVE_PROCS_LOCK:
                 ACTIVE_PROCS.discard(p)
@@ -354,11 +334,6 @@ def _terminate_active_procs():
                 p.kill()
         except Exception:
             pass
-
-=======
-    return p.returncode, "", round(time.time()-start,1)
-
->>>>>>> main
 def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None):
     outp = Path(task["dst"])
     outp.parent.mkdir(parents=True, exist_ok=True)
@@ -385,12 +360,8 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None):
             break
 
     # Robust fallback: hw encoder failed -> retry once with software encoder.
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
     if STOP_EVENT.is_set() or rc == 130:
         return 130, "interrupted", total_dur, used_cmd, used_log
-
-=======
->>>>>>> main
     if rc != 0 and task.get("encoder") in {"nvenc", "qsv", "amf"} and not task.get("custom_params") and len(cmds) == 1:
         sw_opts = _normalize_sw_fallback_opts(task.get("opts", {}))
         fallback_cmd = build_ffmpeg_cmd(Path(task["src"]), Path(task["dst"]), sw_opts, custom_params=None)
@@ -405,10 +376,7 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None):
 
 
 def execute_tasks(tasks, concurrency, work_root: Path, result_csv: Path, logs_root: Path, timeout=None):
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
     STOP_EVENT.clear()
-=======
->>>>>>> main
     total = len(tasks); lock = threading.Lock()
     headers = ["src","dst","group","encoder","codec","preset","rc_mode","br_min","br_max","cqp","ffmpeg_cmd","log","returncode","note","secs"]
     if result_csv.exists(): result_csv.unlink()
@@ -417,7 +385,6 @@ def execute_tasks(tasks, concurrency, work_root: Path, result_csv: Path, logs_ro
         for t in tasks:
             futures[ex.submit(_execute_single_task, t, logs_root, work_root, timeout)] = t
         completed = 0
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
         try:
             for fut in as_completed(futures):
                 t = futures[fut]
@@ -437,20 +404,6 @@ def execute_tasks(tasks, concurrency, work_root: Path, result_csv: Path, logs_ro
             ex.shutdown(wait=False, cancel_futures=True)
             print("Interrupted by user (Ctrl+C). All transcoding processes are being stopped.")
             raise SystemExit(130)
-=======
-        for fut in as_completed(futures):
-            t = futures[fut]
-            rc, note, dur, final_cmd, logp = fut.result()
-            completed += 1
-            entry = {"src":t["src"], "dst":t["dst"], "group":t.get("group",""), "encoder":t.get("encoder",""), "codec":t.get("codec",""),
-                     "preset":t.get("preset",""), "rc_mode":t.get("rc_mode",""), "br_min":t.get("br_min",""), "br_max":t.get("br_max",""),
-                     "cqp":t.get("cqp",""), "ffmpeg_cmd":" ".join(shlex.quote(x) for x in final_cmd), "log":str(logp),
-                     "returncode":rc, "note":note, "secs":dur}
-            with lock:
-                append_csv(result_csv, headers, entry)
-                status = "OK" if rc==0 else f"ERR({rc})"
-                print(f"[{completed}/{total}] {Path(t['src']).name} -> {Path(t['dst']).name} : {status}  log:{logp.name}")
->>>>>>> main
     return
 
 # ---------------- main ----------------
@@ -458,10 +411,7 @@ def main():
     preset_epilog = "\nPRESETS:\n"
     for k,v in PRESETS_INFO.items():
         preset_epilog += f"  {k}: {v['name']} -> {v['desc']}\n"
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
-=======
     preset_epilog += "\nQUALITY ORDER (high -> low):\n  x265 slow 2pass > NVENC P7 > QSV TU1 > QSV TU2 > QSV TU3 > NVENC P1\n"
->>>>>>> main
     examples = """
 EXAMPLES:
   Query encoder params only:
@@ -734,17 +684,7 @@ EXAMPLES:
             # build suggested defaults and skip interactions according to skip flags
             for g in groups:
                 w,h = g["width"], g["height"]
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
                 br_min, br_max = suggest_bitrate_range(w, h)
-=======
-                # rules: width>=3840 -> 30-50; width>=1920 -> 10-20; else 5-10
-                if w and w>=3840:
-                    br_min, br_max = 30,50
-                elif w and w>=1920:
-                    br_min, br_max = 10,20
-                else:
-                    br_min, br_max = 5,10
->>>>>>> main
                 cfg = {"encoder": args.encoder if not args.skip_hwaccel else args.encoder, "codec": args.codec,
                        "rc_mode": args.rc_mode or "vbr", "preset": args.preset, "br_min": args.min_br or br_min, "br_max": args.max_br or br_max,
                        "cqp": args.cqp, "audio_bitrate":320, "scale":"same", "extra":""}
@@ -762,13 +702,7 @@ EXAMPLES:
             for g in groups:
                 gid = g["group_id"]
                 w,h = g["width"], g["height"]
-<<<<<<< codex/refactor-transcode_hw2.py-for-better-structure-n8n9nd
                 br_sugg = suggest_bitrate_range(w, h)
-=======
-                if w and w>=3840: br_sugg=(30,50)
-                elif w and w>=1920: br_sugg=(10,20)
-                else: br_sugg=(5,10)
->>>>>>> main
                 print(f"\nGroup {gid}: {w}x{h} @ {g['fps']} fps  files:{len(g['files'])}")
                 print(f"Suggested bitrate: {br_sugg[0]}-{br_sugg[1]} Mbps")
                 enc = input(f"  encoder [{args.encoder}]: ").strip() or args.encoder
