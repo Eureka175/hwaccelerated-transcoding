@@ -212,7 +212,3 @@ python3 transcode_hw_main.py \
 └── transcode_hw_main.py
 ```
 
-如果你希望，我也可以继续给这个仓库补一份：
-- `README_EN.md`（英文版）
-- `docs/recipes.md`（不同场景参数模板）
-- `examples/`（可直接运行的命令清单）
