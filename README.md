@@ -134,7 +134,7 @@ python3 transcode_hw_main.py \
 
 ---
 
-## 4. 命令示例（更多可直接用）
+## 4. 命令示例
 
 ### 4.1 单文件：高质量归档（NVENC HEVC）
 ```bash
@@ -288,18 +288,10 @@ python3 transcode_hw_main.py \
   --skip-builtin-checks
 ```
 
-### 4.18 先预检，再执行（两步法）
-```bash
-# 第一步：仅查看分组和预检信息
-python3 transcode_hw_main.py --src ./media --work ./work --show-groups-only
-
-# 第二步：确认后再正式执行
-python3 transcode_hw_main.py --src ./media --dst ./out --work ./work --skip
-```
 
 ---
 
-## 5. 常用参数说明（细化版）
+## 5. 常用参数说明
 
 ### 5.1 路径与输入
 - `--src`：输入路径（文件或目录）。
