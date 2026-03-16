@@ -349,8 +349,27 @@ def _forced_quality_args(encoder: str):
 
 
 def _stream_copy_and_metadata_args():
-    """Copy non-video streams and preserve source metadata/chapters/unknown streams."""
-    return ["-map", "0", "-map_metadata", "0", "-map_chapters", "0", "-copy_unknown", "-c", "copy"]
+    """Re-encode only primary video stream while preserving metadata and non-video streams."""
+    return [
+        "-map_metadata", "0",
+        "-map_chapters", "0",
+        "-copy_unknown",
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-map", "0:s?",
+        "-map", "0:d?",
+        "-map", "0:t?",
+    ]
+
+
+def _audio_codec_args_for_output(output_path: Path):
+    """MP4 audio -> AAC 320k (preserve channel layout by not forcing -ac); MOV audio -> copy."""
+    ext = output_path.suffix.lower()
+    if ext == ".mov":
+        return ["-c:a", "copy"]
+    if ext == ".mp4":
+        return ["-c:a", "aac", "-b:a", "320k"]
+    return ["-c:a", "copy"]
 
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
@@ -370,6 +389,8 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
         # 外部透传参数模式：保持用户参数原样，不做内部策略改写。
         return base + shlex.split(custom_params) + [str(output_path)]
     cmd = base.copy() + copy_meta_args
+    cmd += _audio_codec_args_for_output(output_path)
+    cmd += ["-c:s", "copy", "-c:d", "copy", "-c:t", "copy"]
     # scale
     scale = opts.get("scale")
     if scale:
@@ -838,7 +859,10 @@ EXAMPLES:
                 "-x265-params","rc-lookahead=40:aq-mode=3","-passlogfile",str(passlog),
                 "-an","-f","null",null_sink]
         cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp),
-                "-map","0","-map_metadata","0","-map_chapters","0","-copy_unknown","-c","copy",
+                "-map_metadata","0","-map_chapters","0","-copy_unknown",
+                "-map","0:v:0","-map","0:a?","-map","0:s?","-map","0:d?","-map","0:t?"]
+        cmd2 += _audio_codec_args_for_output(outp)
+        cmd2 += ["-c:s","copy","-c:d","copy","-c:t","copy",
                 "-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
                 "-x265-params","rc-lookahead=60:aq-mode=3:aq-strength=0.9:psy-rd=2.0","-passlogfile",str(passlog),
                 str(outp)]
