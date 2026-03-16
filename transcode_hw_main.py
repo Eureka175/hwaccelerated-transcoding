@@ -190,6 +190,57 @@ def _resolve_video_encoder(encoder: str, codec: str):
     return "libx265" if codec == "hevc" else "libx264"
 
 
+def _probe_video_codec_name(input_path: Path):
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1",
+        str(input_path)
+    ]
+    rc, out = run_cmd_capture(cmd)
+    if rc != 0 or not out:
+        return None
+    return out.strip().splitlines()[0].strip().lower()
+
+
+def _resolve_hw_decode_args(encoder: str, src_codec: str):
+    """Return decoder args before `-i` so decode path matches selected HW encoder."""
+    if encoder == "nvenc":
+        # NVENC 对应 NVDEC/CUVID 解码
+        nvdec_map = {
+            "h264": "h264_cuvid",
+            "hevc": "hevc_cuvid",
+            "mpeg2video": "mpeg2_cuvid",
+            "vc1": "vc1_cuvid",
+            "vp8": "vp8_cuvid",
+            "vp9": "vp9_cuvid",
+            "av1": "av1_cuvid",
+        }
+        args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        dec = nvdec_map.get(src_codec)
+        if dec:
+            args += ["-c:v", dec]
+        return args
+    if encoder == "qsv":
+        qsv_map = {
+            "h264": "h264_qsv",
+            "hevc": "hevc_qsv",
+            "mpeg2video": "mpeg2_qsv",
+            "vc1": "vc1_qsv",
+            "vp8": "vp8_qsv",
+            "vp9": "vp9_qsv",
+            "av1": "av1_qsv",
+        }
+        args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        dec = qsv_map.get(src_codec)
+        if dec:
+            args += ["-c:v", dec]
+        return args
+    if encoder == "amf":
+        # FFmpeg 没有通用的 *_amf 解码器，AMD 通常走 D3D11VA 硬解路径
+        return ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+    return []
+
+
 def _normalize_sw_fallback_opts(opts: dict):
     """Map HW-centric opts to software-safe defaults for robust fallback."""
     sw = dict(opts)
@@ -203,7 +254,9 @@ def _normalize_sw_fallback_opts(opts: dict):
 
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
-    base = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i", str(input_path)]
+    src_codec = _probe_video_codec_name(input_path)
+    decode_args = _resolve_hw_decode_args(opts.get("encoder"), src_codec)
+    base = ["ffmpeg","-y","-hide_banner","-loglevel","info", *decode_args, "-i", str(input_path)]
     if custom_params:
         extra = shlex.split(custom_params)
         return base + extra + [str(output_path)]
