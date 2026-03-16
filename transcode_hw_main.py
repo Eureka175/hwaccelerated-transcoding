@@ -20,6 +20,7 @@ from collections import defaultdict, OrderedDict
 STOP_EVENT = threading.Event()
 ACTIVE_PROCS_LOCK = threading.Lock()
 ACTIVE_PROCS = set()
+_FFMPEG_FILTERS_CACHE = None
 # ---------------- presets ----------------
 PRESETS_INFO = OrderedDict([
     ("preset1", {"name":"4k_prog_archive_1pass", "desc":"HEVC NVENC@P7, 1pass, vbr_hq(30/40), main10 p010, aq+lookahead"}),
@@ -241,6 +242,54 @@ def _resolve_hw_decode_args(encoder: str, src_codec: str):
     return []
 
 
+def _get_ffmpeg_filters_text():
+    global _FFMPEG_FILTERS_CACHE
+    if _FFMPEG_FILTERS_CACHE is not None:
+        return _FFMPEG_FILTERS_CACHE
+    rc, out = run_cmd_capture(["ffmpeg", "-hide_banner", "-filters"])
+    _FFMPEG_FILTERS_CACHE = out.lower() if rc == 0 and out else ""
+    return _FFMPEG_FILTERS_CACHE
+
+
+def _has_filter(filter_name: str):
+    text = _get_ffmpeg_filters_text()
+    return f" {filter_name.lower()} " in text
+
+
+def _scale_requested(scale_val):
+    return bool(scale_val and str(scale_val).strip().lower() != "same")
+
+
+def _has_scaling_in_custom_params(custom_params: str):
+    if not custom_params:
+        return False
+    low = custom_params.lower()
+    return any(x in low for x in ["-vf", "-filter:v", "-filter_complex", "scale="])
+
+
+def _resolve_hw_scale_filter(encoder: str, scale_val):
+    if not _scale_requested(scale_val):
+        return None
+    if scale_val == "half":
+        w, h = "iw/2", "ih/2"
+    elif isinstance(scale_val, str) and "x" in scale_val:
+        parts = scale_val.lower().split("x", 1)
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            return None
+        w, h = parts[0], parts[1]
+    else:
+        return None
+
+    if encoder == "nvenc":
+        if _has_filter("scale_cuda"):
+            return ["-vf", f"scale_cuda={w}:{h}"]
+        if _has_filter("scale_npp"):
+            return ["-vf", f"scale_npp={w}:{h}"]
+    if encoder == "qsv" and _has_filter("scale_qsv"):
+        return ["-vf", f"scale_qsv=w={w}:h={h}"]
+    return None
+
+
 def _normalize_sw_fallback_opts(opts: dict):
     """Map HW-centric opts to software-safe defaults for robust fallback."""
     sw = dict(opts)
@@ -255,7 +304,15 @@ def _normalize_sw_fallback_opts(opts: dict):
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
     src_codec = _probe_video_codec_name(input_path)
-    decode_args = _resolve_hw_decode_args(opts.get("encoder"), src_codec)
+    hw_scale_vf = _resolve_hw_scale_filter(opts.get("encoder"), opts.get("scale"))
+    need_sw_decode_for_scale = False
+    if custom_params and _has_scaling_in_custom_params(custom_params):
+        # 自定义参数出现缩放滤镜时，默认走 CPU 解码以避免 HW 帧 + SW scale 不兼容。
+        need_sw_decode_for_scale = not bool(hw_scale_vf)
+    elif _scale_requested(opts.get("scale")):
+        need_sw_decode_for_scale = not bool(hw_scale_vf)
+
+    decode_args = [] if need_sw_decode_for_scale else _resolve_hw_decode_args(opts.get("encoder"), src_codec)
     base = ["ffmpeg","-y","-hide_banner","-loglevel","info", *decode_args, "-i", str(input_path)]
     if custom_params:
         extra = shlex.split(custom_params)
@@ -266,7 +323,9 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     # scale
     scale = opts.get("scale")
     if scale:
-        if scale == "half":
+        if hw_scale_vf:
+            cmd += hw_scale_vf
+        elif scale == "half":
             cmd += ["-vf","scale=iw/2:ih/2"]
         elif scale == "same":
             pass
