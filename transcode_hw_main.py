@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)，增强版
+transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)
 
 主要特性摘要：
  - 支持单文件或目录输入（--src 可为文件或目录）。
@@ -349,16 +349,8 @@ def _forced_quality_args(encoder: str):
 
 
 def _stream_copy_and_metadata_args():
-    """Re-encode only primary video stream while copying other stream types and metadata."""
-    return [
-        "-map_metadata", "0",
-        "-map_chapters", "0",
-        "-map", "0:v:0",
-        "-map", "0:a?",
-        "-map", "0:s?",
-        "-map", "0:d?",
-        "-map", "0:t?",
-    ]
+    """Copy non-video streams and preserve source metadata/chapters/unknown streams."""
+    return ["-map", "0", "-map_metadata", "0", "-map_chapters", "0", "-copy_unknown", "-c", "copy"]
 
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
@@ -378,7 +370,6 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
         # 外部透传参数模式：保持用户参数原样，不做内部策略改写。
         return base + shlex.split(custom_params) + [str(output_path)]
     cmd = base.copy() + copy_meta_args
-    cmd += ["-c:a", "copy", "-c:s", "copy", "-c:d", "copy", "-c:t", "copy"]
     # scale
     scale = opts.get("scale")
     if scale:
@@ -847,9 +838,7 @@ EXAMPLES:
                 "-x265-params","rc-lookahead=40:aq-mode=3","-passlogfile",str(passlog),
                 "-an","-f","null",null_sink]
         cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp),
-                "-map_metadata","0","-map_chapters","0",
-                "-map","0:v:0","-map","0:a?","-map","0:s?","-map","0:d?","-map","0:t?",
-                "-c:a","copy","-c:s","copy","-c:d","copy","-c:t","copy",
+                "-map","0","-map_metadata","0","-map_chapters","0","-copy_unknown","-c","copy",
                 "-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
                 "-x265-params","rc-lookahead=60:aq-mode=3:aq-strength=0.9:psy-rd=2.0","-passlogfile",str(passlog),
                 str(outp)]
