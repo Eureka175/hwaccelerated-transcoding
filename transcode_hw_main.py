@@ -348,18 +348,21 @@ def _forced_quality_args(encoder: str):
     return []
 
 
-def _stream_copy_and_metadata_args():
-    """Re-encode only primary video stream while preserving metadata and non-video streams."""
-    return [
+def _stream_copy_and_metadata_args(output_path: Path):
+    """Map streams by container capability: MP4 keeps core tracks; MOV keeps extra data/attachments too."""
+    ext = output_path.suffix.lower()
+    args = [
         "-map_metadata", "0",
         "-map_chapters", "0",
         "-copy_unknown",
         "-map", "0:v:0",
         "-map", "0:a?",
         "-map", "0:s?",
-        "-map", "0:d?",
-        "-map", "0:t?",
     ]
+    # MOV generally tolerates private camera data tracks better; MP4 often fails muxing on unknown data codecs.
+    if ext == ".mov":
+        args += ["-map", "0:d?", "-map", "0:t?"]
+    return args
 
 
 def _audio_codec_args_for_output(output_path: Path):
@@ -370,6 +373,15 @@ def _audio_codec_args_for_output(output_path: Path):
     if ext == ".mp4":
         return ["-c:a", "aac", "-b:a", "320k"]
     return ["-c:a", "copy"]
+
+
+def _extra_stream_codec_args_for_output(output_path: Path):
+    """Subtitle always copy; data/attachment copy only for MOV to avoid MP4 mux errors on private codecs."""
+    ext = output_path.suffix.lower()
+    args = ["-c:s", "copy"]
+    if ext == ".mov":
+        args += ["-c:d", "copy", "-c:t", "copy"]
+    return args
 
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
@@ -384,13 +396,13 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
 
     decode_args = [] if need_sw_decode_for_scale else _resolve_hw_decode_args(opts.get("encoder"), src_codec)
     base = ["ffmpeg","-y","-hide_banner","-loglevel","info", *decode_args, "-i", str(input_path)]
-    copy_meta_args = _stream_copy_and_metadata_args()
+    copy_meta_args = _stream_copy_and_metadata_args(output_path)
     if custom_params:
         # 外部透传参数模式：保持用户参数原样，不做内部策略改写。
         return base + shlex.split(custom_params) + [str(output_path)]
     cmd = base.copy() + copy_meta_args
     cmd += _audio_codec_args_for_output(output_path)
-    cmd += ["-c:s", "copy", "-c:d", "copy", "-c:t", "copy"]
+    cmd += _extra_stream_codec_args_for_output(output_path)
     # scale
     scale = opts.get("scale")
     if scale:
@@ -858,12 +870,11 @@ EXAMPLES:
                 "-c:v","libx265","-preset","slow","-b:v","6M","-pass","1",
                 "-x265-params","rc-lookahead=40:aq-mode=3","-passlogfile",str(passlog),
                 "-an","-f","null",null_sink]
-        cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp),
-                "-map_metadata","0","-map_chapters","0","-copy_unknown",
-                "-map","0:v:0","-map","0:a?","-map","0:s?","-map","0:d?","-map","0:t?"]
+        cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp)]
+        cmd2 += _stream_copy_and_metadata_args(outp)
         cmd2 += _audio_codec_args_for_output(outp)
-        cmd2 += ["-c:s","copy","-c:d","copy","-c:t","copy",
-                "-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
+        cmd2 += _extra_stream_codec_args_for_output(outp)
+        cmd2 += ["-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
                 "-x265-params","rc-lookahead=60:aq-mode=3:aq-strength=0.9:psy-rd=2.0","-passlogfile",str(passlog),
                 str(outp)]
         return [cmd1, cmd2]
