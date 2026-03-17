@@ -379,7 +379,7 @@ def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
 
     if ext == ".mp4":
         # Keep MP4-safe metadata-like data streams (e.g. tmcd timecode) but avoid private codecs that break muxing.
-        safe_data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
+        safe_data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd", "djmd", "dbgi"}
         for st in _probe_streams(input_path):
             if st.get("codec_type") != "data":
                 continue
@@ -505,6 +505,20 @@ def make_output_path(src: Path, src_root: Path, dst_root: Path, flat_output=Fals
         target = dst_root.joinpath(rel).with_name(name_out + ext)
         target.parent.mkdir(parents=True, exist_ok=True)
         return target
+
+
+def _resolve_output_conflict(target: Path, src: Path):
+    """Keep original filename by default; add _comp suffix only when target conflicts."""
+    base_stem = target.stem
+    suffix = target.suffix
+    candidate = target
+    idx = 0
+    src_abs = str(src.resolve())
+    while candidate.exists() or str(candidate.resolve()) == src_abs:
+        idx += 1
+        tail = "_comp" if idx == 1 else f"_comp{idx}"
+        candidate = target.with_name(f"{base_stem}{tail}{suffix}")
+    return candidate
 
 # ---------------- execution ----------------
 def _run_and_log(cmd, logp: Path, timeout=None, task_label="", src_duration=None, show_progress=True):
@@ -909,9 +923,10 @@ EXAMPLES:
 
     if chosen_mode == "preset":
         opts_map = preset_to_opts(args.use_preset)
-        # if single file: output to same dir as unified MOV with _comp suffix; logs into same-named _logs
+        # if single file: output to same dir with original name/suffix; add _comp on conflict; logs into same-named _logs
         if is_single_file:
-            outp = src.parent.joinpath(f"{src.stem}{out_suffix}_comp.mov")
+            outp = src.parent.joinpath(f"{src.stem}{out_suffix}{src.suffix}")
+            outp = _resolve_output_conflict(outp, src)
             log_root = src.parent.joinpath(f"{src.stem}_logs")
             tasks.append(make_task(src, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(src, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(src))))
             work_logs_root = log_root
@@ -921,7 +936,8 @@ EXAMPLES:
             if not grouping_enabled:
                 for f in files:
                     srcp = Path(f)
-                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
+                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                    outp = _resolve_output_conflict(outp, srcp)
                     tasks.append(make_task(srcp, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(srcp))))
             else:
                 # grouping enabled: build per-group tasks but with same preset applied per-file
@@ -929,7 +945,8 @@ EXAMPLES:
                 for g in entries_groups:
                     for f in g["files"]:
                         srcp = Path(f["path"])
-                        outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
+                        outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                        outp = _resolve_output_conflict(outp, srcp)
                         tasks.append(make_task(srcp, outp, g["group_id"], opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(srcp))))
     elif chosen_mode == "custom":
         if not args.custom_params:
@@ -938,9 +955,10 @@ EXAMPLES:
         for f in files:
             srcp = Path(f)
             if is_single_file:
-                outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}_comp.mov")
+                outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}{srcp.suffix}")
             else:
-                outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
+                outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+            outp = _resolve_output_conflict(outp, srcp)
             tasks.append(make_task(srcp, outp, 0, {}, custom_params=args.custom_params, encoder_label="custom", src_duration_sec=src_duration_map.get(str(srcp))))
         work_logs_root = dst_root.parent.joinpath(f"{dst_root.name}_logs") if args.dst is None else dst_root.parent.joinpath(f"{dst_root.name}_logs")
     else:
@@ -992,9 +1010,10 @@ EXAMPLES:
             for f in g["files"]:
                 srcp = Path(f["path"])
                 if is_single_file:
-                    outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}_comp.mov")
+                    outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}{srcp.suffix}")
                 else:
-                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
+                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                outp = _resolve_output_conflict(outp, srcp)
                 tasks.append(make_task(srcp, outp, g["group_id"], cfg, src_duration_sec=src_duration_map.get(str(srcp))))
 
     # write preflight tasks
