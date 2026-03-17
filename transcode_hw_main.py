@@ -21,16 +21,22 @@ STOP_EVENT = threading.Event()
 ACTIVE_PROCS_LOCK = threading.Lock()
 ACTIVE_PROCS = set()
 _FFMPEG_FILTERS_CACHE = None
+
+FORCED_QUALITY_POLICY = {
+    "nvenc": {"preset": "p7"},
+    "qsv": {"tu": "1"},
+    "amf": {"quality": "quality"},
+}
 # ---------------- presets ----------------
 PRESETS_INFO = OrderedDict([
     ("preset1", {"name":"4k_prog_archive_1pass", "desc":"HEVC NVENC@P7, 1pass, vbr_hq(30/40), main10 p010, aq+lookahead"}),
     ("preset2", {"name":"1080p_prog_rel_1pass", "desc":"HEVC QSV@TU1, 1pass, VBR(6/8), lookahead, aac@320k"}),
     ("preset3", {"name":"4k_prog_archive_2pass", "desc":"HEVC NVENC@P7, multipass fullres, vbr_hq(30/40)"}),
     ("preset4", {"name":"1080p_prog_rel_2pass", "desc":"HEVC x265 slow, 2pass @6M"}),
-    ("preset5", {"name":"fast_proxy_gen_halfres_avc_5m", "desc":"AVC NVENC@P1, tune ll, CBR 5M, half res, aac@128k"}),
-    ("preset6", {"name":"fast_proxy_gen_fullres_avc_5m", "desc":"AVC NVENC@P1, tune ll, CBR 5M, full res, profile high"}),
-    ("preset7", {"name":"social_plat_share_halfres", "desc":"HEVC QSV@TU3, ICQ 28, lookahead, half res, aac@320k"}),
-    ("preset8", {"name":"social_plat_share_fullres", "desc":"HEVC QSV@TU2, ICQ 27, lookahead, full res, aac@320k"}),
+    ("preset5", {"name":"fast_proxy_gen_halfres_avc_5m", "desc":"AVC NVENC(强制P7), tune ll, CBR 5M, half res, aac@128k"}),
+    ("preset6", {"name":"fast_proxy_gen_fullres_avc_5m", "desc":"AVC NVENC(强制P7), tune ll, CBR 5M, full res, profile high"}),
+    ("preset7", {"name":"social_plat_share_halfres", "desc":"HEVC QSV(强制TU1), ICQ 28, lookahead, half res, aac@320k"}),
+    ("preset8", {"name":"social_plat_share_fullres", "desc":"HEVC QSV(强制TU1), ICQ 27, lookahead, full res, aac@320k"}),
 ])
 
 # ---------------- helpers ----------------
@@ -92,6 +98,19 @@ def _parse_fps(s):
         except: return 0.0
     try: return float(s)
     except: return 0.0
+
+
+
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+        txt = str(value).strip()
+        if not txt or txt.upper() == "N/A":
+            return None
+        return float(txt)
+    except Exception:
+        return None
 
 def write_csv(path: Path, headers, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +222,20 @@ def _probe_video_codec_name(input_path: Path):
     return out.strip().splitlines()[0].strip().lower()
 
 
+def _probe_streams(input_path: Path):
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries",
+        "stream=index,codec_type,codec_tag_string,codec_name,disposition", "-of", "json", str(input_path)
+    ]
+    rc, out = run_cmd_capture(cmd)
+    if rc != 0 or not out:
+        return []
+    try:
+        return (json.loads(out) or {}).get("streams", []) or []
+    except Exception:
+        return []
+
+
 def _resolve_hw_decode_args(encoder: str, src_codec: str):
     """Return decoder args before `-i` so decode path matches selected HW encoder."""
     if encoder == "nvenc":
@@ -302,6 +335,83 @@ def _normalize_sw_fallback_opts(opts: dict):
     return sw
 
 
+def _strip_conflicting_quality_tokens(tokens, encoder: str):
+    """Remove tokens that conflict with forced HW quality policy."""
+    remove_keys = {"-preset", "-quality", "-tu"}
+    if encoder not in {"nvenc", "qsv", "amf"}:
+        return tokens
+    out = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in remove_keys:
+            i += 2
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
+def _forced_quality_args(encoder: str):
+    if encoder == "nvenc":
+        return ["-preset", FORCED_QUALITY_POLICY["nvenc"]["preset"]]
+    if encoder == "qsv":
+        return ["-tu", FORCED_QUALITY_POLICY["qsv"]["tu"]]
+    if encoder == "amf":
+        return ["-quality", FORCED_QUALITY_POLICY["amf"]["quality"]]
+    return []
+
+
+def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
+    """Map streams with container-aware extras: MP4 keeps safe timed metadata; MOV keeps all data/attachments."""
+    ext = output_path.suffix.lower()
+    args = [
+        "-map_metadata", "0",
+        "-map_chapters", "0",
+        "-copy_unknown",
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-map", "0:s?",
+    ]
+    if ext == ".mov":
+        args += ["-map", "0:d?", "-map", "0:t?"]
+        return args
+
+    if ext == ".mp4":
+        # Keep MP4-safe metadata-like data streams (e.g. tmcd timecode) but avoid private codecs that break muxing.
+        safe_data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd", "djmd", "dbgi"}
+        for st in _probe_streams(input_path):
+            if st.get("codec_type") != "data":
+                continue
+            tag = (st.get("codec_tag_string") or "").strip().lower()
+            if tag in safe_data_tags:
+                idx = st.get("index")
+                if isinstance(idx, int):
+                    args += ["-map", f"0:{idx}"]
+    return args
+
+
+def _audio_codec_args_for_output(output_path: Path):
+    """MP4 audio -> AAC 320k (preserve channel layout by not forcing -ac); MOV audio -> copy."""
+    ext = output_path.suffix.lower()
+    if ext == ".mov":
+        return ["-c:a", "copy"]
+    if ext == ".mp4":
+        return ["-c:a", "aac", "-b:a", "320k"]
+    return ["-c:a", "copy"]
+
+
+def _extra_stream_codec_args_for_output(output_path: Path):
+    """Subtitle always copy; data/attachment copy for MOV and MP4-safe mapped data streams."""
+    ext = output_path.suffix.lower()
+    args = ["-c:s", "copy"]
+    if ext in {".mov", ".mp4"}:
+        args += ["-c:d", "copy"]
+    if ext == ".mov":
+        args += ["-c:t", "copy"]
+    return args
+
+
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
     src_codec = _probe_video_codec_name(input_path)
     hw_scale_vf = _resolve_hw_scale_filter(opts.get("encoder"), opts.get("scale"))
@@ -314,12 +424,13 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
 
     decode_args = [] if need_sw_decode_for_scale else _resolve_hw_decode_args(opts.get("encoder"), src_codec)
     base = ["ffmpeg","-y","-hide_banner","-loglevel","info", *decode_args, "-i", str(input_path)]
+    copy_meta_args = _stream_copy_and_metadata_args(input_path, output_path)
     if custom_params:
-        extra = shlex.split(custom_params)
-        return base + extra + [str(output_path)]
-    # audio
-    ab = opts.get("audio_bitrate",320)
-    cmd = base.copy()
+        # 外部透传参数模式：保持用户参数原样，不做内部策略改写。
+        return base + shlex.split(custom_params) + [str(output_path)]
+    cmd = base.copy() + copy_meta_args
+    cmd += _audio_codec_args_for_output(output_path)
+    cmd += _extra_stream_codec_args_for_output(output_path)
     # scale
     scale = opts.get("scale")
     if scale:
@@ -331,8 +442,6 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             pass
         else:
             cmd += ["-vf", f"scale={scale}"]
-    # audio
-    cmd += ["-c:a","aac","-b:a",f"{int(ab)}k"]
     # video encoder
     codec = opts.get("codec","hevc")
     enc = _resolve_video_encoder(opts.get("encoder"), codec)
@@ -370,7 +479,8 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
         elif rc=="vbr" and br_min:
             cmd += ["-b:v", human_bitrate(br_min)]
     if opts.get("extra"):
-        cmd += shlex.split(opts.get("extra"))
+        cmd += _strip_conflicting_quality_tokens(shlex.split(opts.get("extra")), opts.get("encoder"))
+    cmd += _forced_quality_args(opts.get("encoder"))
     cmd += [str(output_path)]
     return cmd
 
@@ -396,8 +506,22 @@ def make_output_path(src: Path, src_root: Path, dst_root: Path, flat_output=Fals
         target.parent.mkdir(parents=True, exist_ok=True)
         return target
 
+
+def _resolve_output_conflict(target: Path, src: Path):
+    """Keep original filename by default; add _comp suffix only when target conflicts."""
+    base_stem = target.stem
+    suffix = target.suffix
+    candidate = target
+    idx = 0
+    src_abs = str(src.resolve())
+    while candidate.exists() or str(candidate.resolve()) == src_abs:
+        idx += 1
+        tail = "_comp" if idx == 1 else f"_comp{idx}"
+        candidate = target.with_name(f"{base_stem}{tail}{suffix}")
+    return candidate
+
 # ---------------- execution ----------------
-def _run_and_log(cmd, logp: Path, timeout=None):
+def _run_and_log(cmd, logp: Path, timeout=None, task_label="", src_duration=None, show_progress=True):
     if STOP_EVENT.is_set():
         return 130, "interrupted", 0.0
     start = time.time()
@@ -411,6 +535,7 @@ def _run_and_log(cmd, logp: Path, timeout=None):
     with ACTIVE_PROCS_LOCK:
         ACTIVE_PROCS.add(p)
     logp.parent.mkdir(parents=True, exist_ok=True)
+    last_progress_print = 0.0
     with logp.open("wb") as f:
         try:
             for chunk in p.stdout:
@@ -419,6 +544,23 @@ def _run_and_log(cmd, logp: Path, timeout=None):
                     return 130, "interrupted", round(time.time()-start,1)
                 if chunk is None: continue
                 f.write(chunk)
+                if show_progress:
+                    try:
+                        line = chunk.decode(errors="ignore").strip()
+                    except Exception:
+                        line = ""
+                    if "time=" in line:
+                        idx = line.find("time=")
+                        tval = line[idx+5:].split()[0]
+                        now = time.time()
+                        if now - last_progress_print >= 1.0:
+                            last_progress_print = now
+                            sec = _ffmpeg_time_to_seconds(tval)
+                            if src_duration and src_duration > 0:
+                                pct = min(100.0, max(0.0, sec * 100.0 / src_duration))
+                                print(f"    progress[{task_label}] {pct:5.1f}% ({sec:.1f}s/{src_duration:.1f}s)")
+                            else:
+                                print(f"    progress[{task_label}] t={tval}")
             p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             p.kill()
@@ -446,7 +588,15 @@ def _terminate_active_procs():
                 p.kill()
         except Exception:
             pass
-def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None):
+
+
+def _ffmpeg_time_to_seconds(val: str):
+    try:
+        hh, mm, ss = val.split(":")
+        return int(hh) * 3600 + int(mm) * 60 + float(ss)
+    except Exception:
+        return 0.0
+def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, show_progress=True):
     outp = Path(task["dst"])
     outp.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -464,7 +614,14 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None):
     used_log = primary_log
     for idx, cmd in enumerate(cmds, start=1):
         step_log = primary_log if len(cmds) == 1 else primary_log.with_name(primary_log.stem + f".pass{idx}.log")
-        rc, note, dur = _run_and_log(cmd, step_log, timeout)
+        rc, note, dur = _run_and_log(
+            cmd,
+            step_log,
+            timeout,
+            task_label=Path(task["src"]).name,
+            src_duration=task.get("src_duration_sec"),
+            show_progress=show_progress,
+        )
         total_dur += dur
         used_cmd = cmd
         used_log = step_log
@@ -478,7 +635,14 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None):
         sw_opts = _normalize_sw_fallback_opts(task.get("opts", {}))
         fallback_cmd = build_ffmpeg_cmd(Path(task["src"]), Path(task["dst"]), sw_opts, custom_params=None)
         fallback_log = primary_log.with_name(primary_log.stem + ".fallback.log")
-        rc2, note2, dur2 = _run_and_log(fallback_cmd, fallback_log, timeout)
+        rc2, note2, dur2 = _run_and_log(
+            fallback_cmd,
+            fallback_log,
+            timeout,
+            task_label=Path(task["src"]).name + "(fallback)",
+            src_duration=task.get("src_duration_sec"),
+            show_progress=show_progress,
+        )
         total_dur += dur2
         if rc2 == 0:
             return rc2, f"fallback-ok: {task.get('encoder')} -> cpu", total_dur, fallback_cmd, fallback_log
@@ -487,7 +651,7 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None):
     return rc, note, total_dur, used_cmd, used_log
 
 
-def execute_tasks(tasks, concurrency, work_root: Path, result_csv: Path, logs_root: Path, timeout=None):
+def execute_tasks(tasks, concurrency, work_root: Path, result_csv: Path, logs_root: Path, timeout=None, show_progress=True):
     STOP_EVENT.clear()
     total = len(tasks); lock = threading.Lock()
     headers = ["src","dst","group","encoder","codec","preset","rc_mode","br_min","br_max","cqp","ffmpeg_cmd","log","returncode","note","secs"]
@@ -495,7 +659,7 @@ def execute_tasks(tasks, concurrency, work_root: Path, result_csv: Path, logs_ro
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futures = {}
         for t in tasks:
-            futures[ex.submit(_execute_single_task, t, logs_root, work_root, timeout)] = t
+            futures[ex.submit(_execute_single_task, t, logs_root, work_root, timeout, show_progress)] = t
         completed = 0
         try:
             for fut in as_completed(futures):
@@ -578,6 +742,8 @@ EXAMPLES:
     parser.add_argument("--out-suffix", default="", help="输出文件名后缀（例如 _comp 或 preset1）。若值为 preset1..preset8，则后缀会被替换为该 preset 的描述文本。")
     args = parser.parse_args()
 
+    print("Forced quality policy: NVENC preset=P7, QSV TU=1, AMF quality=quality")
+
     # handle query-only case
     if args.query_params and not args.src and not args.work:
         # require only work to save file; if not provided, use cwd/work_query
@@ -633,7 +799,7 @@ EXAMPLES:
     prefixes = [p for p in (x.strip() for x in args.prefixes.split(",") if x.strip())] if args.prefixes else []
     suffixes = [s for s in (x.strip() for x in args.suffixes.split(",") if x.strip())] if args.suffixes else []
 
-    def make_task(srcp: Path, outp: Path, group_id, opts: dict, custom_params=None, encoder_label=None, ffmpeg_cmds=None):
+    def make_task(srcp: Path, outp: Path, group_id, opts: dict, custom_params=None, encoder_label=None, ffmpeg_cmds=None, src_duration_sec=None):
         cmd = build_ffmpeg_cmd(srcp, outp, opts or {}, custom_params=custom_params)
         task = {
             "src": str(srcp),
@@ -649,6 +815,7 @@ EXAMPLES:
             "opts": opts or {},
             "custom_params": custom_params,
             "ffmpeg_cmd": cmd,
+            "src_duration_sec": src_duration_sec,
         }
         if ffmpeg_cmds:
             task["ffmpeg_cmds"] = ffmpeg_cmds
@@ -664,6 +831,7 @@ EXAMPLES:
         print("No files found. Exiting."); sys.exit(0)
     print(f"Found {len(files)} input files. Probing media info...")
     entries, groups = group_by_res_fps(files)
+    src_duration_map = {str(e.get("path")): _safe_float(e.get("duration")) for e in entries}
     write_csv(preflight_csv, ["path","width","height","fps","codec","duration","bitrate"], entries)
     # write groups summary
     grp_rows = []
@@ -744,19 +912,23 @@ EXAMPLES:
                 "-c:v","libx265","-preset","slow","-b:v","6M","-pass","1",
                 "-x265-params","rc-lookahead=40:aq-mode=3","-passlogfile",str(passlog),
                 "-an","-f","null",null_sink]
-        cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp),
-                "-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
+        cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp)]
+        cmd2 += _stream_copy_and_metadata_args(srcp, outp)
+        cmd2 += _audio_codec_args_for_output(outp)
+        cmd2 += _extra_stream_codec_args_for_output(outp)
+        cmd2 += ["-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
                 "-x265-params","rc-lookahead=60:aq-mode=3:aq-strength=0.9:psy-rd=2.0","-passlogfile",str(passlog),
-                "-c:a","aac","-b:a","320k",str(outp)]
+                str(outp)]
         return [cmd1, cmd2]
 
     if chosen_mode == "preset":
         opts_map = preset_to_opts(args.use_preset)
-        # if single file: output to same dir with _comp suffix; logs into same-named _logs
+        # if single file: output to same dir with original name/suffix; add _comp on conflict; logs into same-named _logs
         if is_single_file:
-            outp = src.parent.joinpath(f"{src.stem}{out_suffix}_comp{src.suffix}")
+            outp = src.parent.joinpath(f"{src.stem}{out_suffix}{src.suffix}")
+            outp = _resolve_output_conflict(outp, src)
             log_root = src.parent.joinpath(f"{src.stem}_logs")
-            tasks.append(make_task(src, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(src, outp) if args.use_preset == "preset4" else None))
+            tasks.append(make_task(src, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(src, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(src))))
             work_logs_root = log_root
         else:
             work_logs_root = dst_root.parent.joinpath(f"{dst_root.name}_logs") if args.dst is None else dst_root.parent.joinpath(f"{dst_root.name}_logs")
@@ -764,16 +936,18 @@ EXAMPLES:
             if not grouping_enabled:
                 for f in files:
                     srcp = Path(f)
-                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
-                    tasks.append(make_task(srcp, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None))
+                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                    outp = _resolve_output_conflict(outp, srcp)
+                    tasks.append(make_task(srcp, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(srcp))))
             else:
                 # grouping enabled: build per-group tasks but with same preset applied per-file
                 entries_groups = groups
                 for g in entries_groups:
                     for f in g["files"]:
                         srcp = Path(f["path"])
-                        outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
-                        tasks.append(make_task(srcp, outp, g["group_id"], opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None))
+                        outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                        outp = _resolve_output_conflict(outp, srcp)
+                        tasks.append(make_task(srcp, outp, g["group_id"], opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(srcp))))
     elif chosen_mode == "custom":
         if not args.custom_params:
             print("custom mode selected but no --custom-params given. Exiting."); sys.exit(2)
@@ -781,10 +955,11 @@ EXAMPLES:
         for f in files:
             srcp = Path(f)
             if is_single_file:
-                outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}_comp{srcp.suffix}")
+                outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}{srcp.suffix}")
             else:
-                outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
-            tasks.append(make_task(srcp, outp, 0, {}, custom_params=args.custom_params, encoder_label="custom"))
+                outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+            outp = _resolve_output_conflict(outp, srcp)
+            tasks.append(make_task(srcp, outp, 0, {}, custom_params=args.custom_params, encoder_label="custom", src_duration_sec=src_duration_map.get(str(srcp))))
         work_logs_root = dst_root.parent.joinpath(f"{dst_root.name}_logs") if args.dst is None else dst_root.parent.joinpath(f"{dst_root.name}_logs")
     else:
         # interactive/default CLI flow: if no-group -> one group; else per-group interactive (but can be skipped by --skip)
@@ -835,10 +1010,11 @@ EXAMPLES:
             for f in g["files"]:
                 srcp = Path(f["path"])
                 if is_single_file:
-                    outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}_comp{srcp.suffix}")
+                    outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}{srcp.suffix}")
                 else:
-                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
-                tasks.append(make_task(srcp, outp, g["group_id"], cfg))
+                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                outp = _resolve_output_conflict(outp, srcp)
+                tasks.append(make_task(srcp, outp, g["group_id"], cfg, src_duration_sec=src_duration_map.get(str(srcp))))
 
     # write preflight tasks
     with tasks_json.open("w", encoding='utf-8') as jf:
@@ -859,7 +1035,7 @@ EXAMPLES:
             logs_dir = dst_root.parent.joinpath(f"{dst_root.name}_logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     # execute
-    execute_tasks(tasks, args.concurrency, work_root, result_csv, logs_dir, timeout=args.timeout)
+    execute_tasks(tasks, args.concurrency, work_root, result_csv, logs_dir, timeout=args.timeout, show_progress=True)
     # post media info
     out_entries = []
     for t in tasks:
