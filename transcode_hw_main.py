@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)，增强版
+transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)
 
 主要特性摘要：
  - 支持单文件或目录输入（--src 可为文件或目录）。
