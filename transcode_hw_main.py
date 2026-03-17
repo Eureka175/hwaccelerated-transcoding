@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)，增强版
+transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)
 
 主要特性摘要：
  - 支持单文件或目录输入（--src 可为文件或目录）。
@@ -492,7 +492,7 @@ def make_output_path(src: Path, src_root: Path, dst_root: Path, flat_output=Fals
         name_out = f"{name}{out_suffix}"
     else:
         name_out = name
-    ext = src.suffix
+    ext = ".mov"
     if flat_output:
         # put everything directly in dst_root; if name collision, append parent dir name
         dst_root.mkdir(parents=True, exist_ok=True)
