@@ -492,7 +492,7 @@ def make_output_path(src: Path, src_root: Path, dst_root: Path, flat_output=Fals
         name_out = f"{name}{out_suffix}"
     else:
         name_out = name
-    ext = src.suffix
+    ext = ".mov"
     if flat_output:
         # put everything directly in dst_root; if name collision, append parent dir name
         dst_root.mkdir(parents=True, exist_ok=True)
@@ -909,9 +909,9 @@ EXAMPLES:
 
     if chosen_mode == "preset":
         opts_map = preset_to_opts(args.use_preset)
-        # if single file: output to same dir with _comp suffix; logs into same-named _logs
+        # if single file: output to same dir as unified MOV with _comp suffix; logs into same-named _logs
         if is_single_file:
-            outp = src.parent.joinpath(f"{src.stem}{out_suffix}_comp{src.suffix}")
+            outp = src.parent.joinpath(f"{src.stem}{out_suffix}_comp.mov")
             log_root = src.parent.joinpath(f"{src.stem}_logs")
             tasks.append(make_task(src, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(src, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(src))))
             work_logs_root = log_root
@@ -938,7 +938,7 @@ EXAMPLES:
         for f in files:
             srcp = Path(f)
             if is_single_file:
-                outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}_comp{srcp.suffix}")
+                outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}_comp.mov")
             else:
                 outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
             tasks.append(make_task(srcp, outp, 0, {}, custom_params=args.custom_params, encoder_label="custom", src_duration_sec=src_duration_map.get(str(srcp))))
@@ -992,7 +992,7 @@ EXAMPLES:
             for f in g["files"]:
                 srcp = Path(f["path"])
                 if is_single_file:
-                    outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}_comp{srcp.suffix}")
+                    outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}_comp.mov")
                 else:
                     outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix+"_comp")
                 tasks.append(make_task(srcp, outp, g["group_id"], cfg, src_duration_sec=src_duration_map.get(str(srcp))))
