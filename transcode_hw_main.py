@@ -222,6 +222,20 @@ def _probe_video_codec_name(input_path: Path):
     return out.strip().splitlines()[0].strip().lower()
 
 
+def _probe_streams(input_path: Path):
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries",
+        "stream=index,codec_type,codec_tag_string,codec_name,disposition", "-of", "json", str(input_path)
+    ]
+    rc, out = run_cmd_capture(cmd)
+    if rc != 0 or not out:
+        return []
+    try:
+        return (json.loads(out) or {}).get("streams", []) or []
+    except Exception:
+        return []
+
+
 def _resolve_hw_decode_args(encoder: str, src_codec: str):
     """Return decoder args before `-i` so decode path matches selected HW encoder."""
     if encoder == "nvenc":
@@ -348,8 +362,8 @@ def _forced_quality_args(encoder: str):
     return []
 
 
-def _stream_copy_and_metadata_args(output_path: Path):
-    """Map streams by container capability: MP4 keeps core tracks; MOV keeps extra data/attachments too."""
+def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
+    """Map streams with container-aware extras: MP4 keeps safe timed metadata; MOV keeps all data/attachments."""
     ext = output_path.suffix.lower()
     args = [
         "-map_metadata", "0",
@@ -359,9 +373,21 @@ def _stream_copy_and_metadata_args(output_path: Path):
         "-map", "0:a?",
         "-map", "0:s?",
     ]
-    # MOV generally tolerates private camera data tracks better; MP4 often fails muxing on unknown data codecs.
     if ext == ".mov":
         args += ["-map", "0:d?", "-map", "0:t?"]
+        return args
+
+    if ext == ".mp4":
+        # Keep MP4-safe metadata-like data streams (e.g. tmcd timecode) but avoid private codecs that break muxing.
+        safe_data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
+        for st in _probe_streams(input_path):
+            if st.get("codec_type") != "data":
+                continue
+            tag = (st.get("codec_tag_string") or "").strip().lower()
+            if tag in safe_data_tags:
+                idx = st.get("index")
+                if isinstance(idx, int):
+                    args += ["-map", f"0:{idx}"]
     return args
 
 
@@ -376,11 +402,13 @@ def _audio_codec_args_for_output(output_path: Path):
 
 
 def _extra_stream_codec_args_for_output(output_path: Path):
-    """Subtitle always copy; data/attachment copy only for MOV to avoid MP4 mux errors on private codecs."""
+    """Subtitle always copy; data/attachment copy for MOV and MP4-safe mapped data streams."""
     ext = output_path.suffix.lower()
     args = ["-c:s", "copy"]
+    if ext in {".mov", ".mp4"}:
+        args += ["-c:d", "copy"]
     if ext == ".mov":
-        args += ["-c:d", "copy", "-c:t", "copy"]
+        args += ["-c:t", "copy"]
     return args
 
 
@@ -396,7 +424,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
 
     decode_args = [] if need_sw_decode_for_scale else _resolve_hw_decode_args(opts.get("encoder"), src_codec)
     base = ["ffmpeg","-y","-hide_banner","-loglevel","info", *decode_args, "-i", str(input_path)]
-    copy_meta_args = _stream_copy_and_metadata_args(output_path)
+    copy_meta_args = _stream_copy_and_metadata_args(input_path, output_path)
     if custom_params:
         # 外部透传参数模式：保持用户参数原样，不做内部策略改写。
         return base + shlex.split(custom_params) + [str(output_path)]
@@ -871,7 +899,7 @@ EXAMPLES:
                 "-x265-params","rc-lookahead=40:aq-mode=3","-passlogfile",str(passlog),
                 "-an","-f","null",null_sink]
         cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp)]
-        cmd2 += _stream_copy_and_metadata_args(outp)
+        cmd2 += _stream_copy_and_metadata_args(srcp, outp)
         cmd2 += _audio_codec_args_for_output(outp)
         cmd2 += _extra_stream_codec_args_for_output(outp)
         cmd2 += ["-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
