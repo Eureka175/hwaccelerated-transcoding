@@ -225,7 +225,7 @@ def _probe_video_codec_name(input_path: Path):
 def _probe_streams(input_path: Path):
     cmd = [
         "ffprobe", "-v", "error", "-show_entries",
-        "stream=index,codec_type,codec_tag_string,codec_name,disposition", "-of", "json", str(input_path)
+        "stream=index,codec_type,codec_tag_string,codec_name,disposition:stream_tags", "-of", "json", str(input_path)
     ]
     rc, out = run_cmd_capture(cmd)
     if rc != 0 or not out:
@@ -234,6 +234,29 @@ def _probe_streams(input_path: Path):
         return (json.loads(out) or {}).get("streams", []) or []
     except Exception:
         return []
+
+
+def _should_force_mov_output(input_path: Path):
+    """If probe finds metadata/data-like side streams, force MOV output for better container compatibility."""
+    streams = _probe_streams(input_path)
+    if not streams:
+        return False
+    data_tags = {"djmd", "dbgi", "tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
+    for st in streams:
+        ctype = (st.get("codec_type") or "").lower()
+        if ctype in {"data", "attachment"}:
+            return True
+        disp = st.get("disposition") or {}
+        if isinstance(disp, dict) and int(disp.get("attached_pic", 0) or 0) == 1:
+            return True
+        tag = (st.get("codec_tag_string") or "").strip().lower()
+        if tag in data_tags:
+            return True
+        tags = st.get("tags") or {}
+        handler = str(tags.get("handler_name", "")).lower()
+        if any(k in handler for k in ["dji", "meta", "timecode"]):
+            return True
+    return False
 
 
 def _resolve_hw_decode_args(encoder: str, src_codec: str):
@@ -558,10 +581,12 @@ def _run_and_log(cmd, logp: Path, timeout=None, task_label="", src_duration=None
                             sec = _ffmpeg_time_to_seconds(tval)
                             if src_duration and src_duration > 0:
                                 pct = min(100.0, max(0.0, sec * 100.0 / src_duration))
-                                print(f"    progress[{task_label}] {pct:5.1f}% ({sec:.1f}s/{src_duration:.1f}s)")
+                                print(f"\r    progress[{task_label}] {pct:5.1f}% ({sec:.1f}s/{src_duration:.1f}s)", end="", flush=True)
                             else:
-                                print(f"    progress[{task_label}] t={tval}")
+                                print(f"\r    progress[{task_label}] t={tval}", end="", flush=True)
             p.wait(timeout=timeout)
+            if show_progress:
+                print("", flush=True)
         except subprocess.TimeoutExpired:
             p.kill()
             return -9, "timeout", round(time.time()-start,1)
@@ -821,6 +846,11 @@ EXAMPLES:
             task["ffmpeg_cmds"] = ffmpeg_cmds
         return task
 
+    def _apply_container_policy(srcp: Path, outp: Path):
+        if force_mov_map.get(str(srcp), False):
+            return outp.with_suffix(".mov")
+        return outp
+
     # collect files
     files = []
     if is_single_file:
@@ -832,6 +862,7 @@ EXAMPLES:
     print(f"Found {len(files)} input files. Probing media info...")
     entries, groups = group_by_res_fps(files)
     src_duration_map = {str(e.get("path")): _safe_float(e.get("duration")) for e in entries}
+    force_mov_map = {str(Path(e.get("path"))): _should_force_mov_output(Path(e.get("path"))) for e in entries}
     write_csv(preflight_csv, ["path","width","height","fps","codec","duration","bitrate"], entries)
     # write groups summary
     grp_rows = []
@@ -926,6 +957,7 @@ EXAMPLES:
         # if single file: output to same dir with original name/suffix; add _comp on conflict; logs into same-named _logs
         if is_single_file:
             outp = src.parent.joinpath(f"{src.stem}{out_suffix}{src.suffix}")
+            outp = _apply_container_policy(src, outp)
             outp = _resolve_output_conflict(outp, src)
             log_root = src.parent.joinpath(f"{src.stem}_logs")
             tasks.append(make_task(src, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(src, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(src))))
@@ -937,6 +969,7 @@ EXAMPLES:
                 for f in files:
                     srcp = Path(f)
                     outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                    outp = _apply_container_policy(srcp, outp)
                     outp = _resolve_output_conflict(outp, srcp)
                     tasks.append(make_task(srcp, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(srcp))))
             else:
@@ -946,6 +979,7 @@ EXAMPLES:
                     for f in g["files"]:
                         srcp = Path(f["path"])
                         outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                        outp = _apply_container_policy(srcp, outp)
                         outp = _resolve_output_conflict(outp, srcp)
                         tasks.append(make_task(srcp, outp, g["group_id"], opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(srcp))))
     elif chosen_mode == "custom":
@@ -958,6 +992,7 @@ EXAMPLES:
                 outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}{srcp.suffix}")
             else:
                 outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+            outp = _apply_container_policy(srcp, outp)
             outp = _resolve_output_conflict(outp, srcp)
             tasks.append(make_task(srcp, outp, 0, {}, custom_params=args.custom_params, encoder_label="custom", src_duration_sec=src_duration_map.get(str(srcp))))
         work_logs_root = dst_root.parent.joinpath(f"{dst_root.name}_logs") if args.dst is None else dst_root.parent.joinpath(f"{dst_root.name}_logs")
@@ -1013,6 +1048,7 @@ EXAMPLES:
                     outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}{srcp.suffix}")
                 else:
                     outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                outp = _apply_container_policy(srcp, outp)
                 outp = _resolve_output_conflict(outp, srcp)
                 tasks.append(make_task(srcp, outp, g["group_id"], cfg, src_duration_sec=src_duration_map.get(str(srcp))))
 
