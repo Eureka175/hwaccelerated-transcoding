@@ -44,6 +44,20 @@
 - `pre_media_info.csv` / `post_media_info.csv`：转码前后媒体信息
 - `*_logs/*.log`：每个任务独立日志
 
+
+### 1.5 强制质量策略（本版本默认）
+无论你在命令行、交互模式、预设模式里如何设置，脚本都会在最终 ffmpeg 命令层面强制：
+- NVENC：`-preset p7`
+- QSV：`-tu 1`
+- AMF：`-quality quality`（AMF 最高质量档）
+
+另外：
+- 默认仅压缩主视频流（`0:v:0`），避免 attached pic 等附加视频流触发误重编码。
+- 默认保留全部输入元数据与章节（含常见运动相机型号信息）。流保留按容器能力处理：MOV 尽量保留数据/附件流；MP4 会在保证可封装前提下尽量保留安全的数据流（如 timecode/tmcd），并规避会导致封装失败的私有 data track。
+- 输出默认保持原始文件名和后缀；仅在目标冲突时自动追加 `_comp`（如 `A.mp4 -> A_comp.mp4`）。
+- 若 `ffprobe` 发现 metadata/data/附件等扩展流（如 `djmd/dbgi/tmcd`），该文件自动改为输出 `MOV`，以规避 MP4 容器兼容问题。
+- 音频策略：`MP4 -> AAC 320k`（不强制 `-ac`，保留原始声道布局）；`MOV -> audio copy`。
+
 ---
 
 ## 2. 环境要求
