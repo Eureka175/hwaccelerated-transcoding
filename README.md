@@ -45,11 +45,18 @@
 - `*_logs/*.log`：每个任务独立日志
 
 
-### 1.5 强制质量策略（本版本默认）
+### 1.5 强制质量策略（默认启用，可手动覆盖）
 无论你在命令行、交互模式、预设模式里如何设置，脚本都会在最终 ffmpeg 命令层面强制：
 - NVENC：`-preset p7`
 - QSV：`-tu 1`
 - AMF：`-quality quality`（AMF 最高质量档）
+
+可用快速覆盖参数手动改写该策略：
+- `--nvenc-qual p7`（示例：`p1..p7`）
+- `--qsv-qual tu1`（也支持 `--qsv-qual 1`）
+- `--amf-qual quality`（例如 `quality/balanced/speed`）
+
+如果使用 `--custom-params` 手动注入 ffmpeg 参数，则该任务完全以手动参数为准。
 
 另外：
 - 默认仅压缩主视频流（`0:v:0`），避免 attached pic 等附加视频流触发误重编码。
