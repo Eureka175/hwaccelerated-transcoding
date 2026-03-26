@@ -22,11 +22,12 @@ ACTIVE_PROCS_LOCK = threading.Lock()
 ACTIVE_PROCS = set()
 _FFMPEG_FILTERS_CACHE = None
 
-FORCED_QUALITY_POLICY = {
+DEFAULT_FORCED_QUALITY_POLICY = {
     "nvenc": {"preset": "p7"},
     "qsv": {"tu": "1"},
     "amf": {"quality": "quality"},
 }
+FORCED_QUALITY_POLICY = json.loads(json.dumps(DEFAULT_FORCED_QUALITY_POLICY))
 # ---------------- presets ----------------
 PRESETS_INFO = OrderedDict([
     ("preset1", {"name":"4k_prog_archive_1pass", "desc":"HEVC NVENC@P7, 1pass, vbr_hq(30/40), main10 p010, aq+lookahead"}),
@@ -765,9 +766,33 @@ EXAMPLES:
     parser.add_argument("--show-groups-only", action="store_true", help="仅显示分组与 preflight CSV，然后退出")
     parser.add_argument("--flat-output", action="store_true", help="所有输出放在同一目标目录（不保留原始目录结构）；若冲突自动在文件名加源目录名后缀")
     parser.add_argument("--out-suffix", default="", help="输出文件名后缀（例如 _comp 或 preset1）。若值为 preset1..preset8，则后缀会被替换为该 preset 的描述文本。")
+    parser.add_argument("--nvenc-qual", default=None, help="快速手动覆盖 NVENC 质量档（例如 p7/p5）。设置后将覆盖默认强制策略。")
+    parser.add_argument("--qsv-qual", default=None, help="快速手动覆盖 QSV TU 档位（例如 tu1/tu3 或 1/3）。设置后将覆盖默认强制策略。")
+    parser.add_argument("--amf-qual", default=None, help="快速手动覆盖 AMF quality（例如 quality/balanced/speed）。设置后将覆盖默认强制策略。")
     args = parser.parse_args()
 
-    print("Forced quality policy: NVENC preset=P7, QSV TU=1, AMF quality=quality")
+    # reset to default every run
+    FORCED_QUALITY_POLICY["nvenc"]["preset"] = DEFAULT_FORCED_QUALITY_POLICY["nvenc"]["preset"]
+    FORCED_QUALITY_POLICY["qsv"]["tu"] = DEFAULT_FORCED_QUALITY_POLICY["qsv"]["tu"]
+    FORCED_QUALITY_POLICY["amf"]["quality"] = DEFAULT_FORCED_QUALITY_POLICY["amf"]["quality"]
+    if args.nvenc_qual:
+        FORCED_QUALITY_POLICY["nvenc"]["preset"] = str(args.nvenc_qual).strip().lower()
+    if args.qsv_qual:
+        qsv_q = str(args.qsv_qual).strip().lower()
+        if qsv_q.startswith("tu"):
+            qsv_q = qsv_q[2:]
+        FORCED_QUALITY_POLICY["qsv"]["tu"] = qsv_q
+    if args.amf_qual:
+        FORCED_QUALITY_POLICY["amf"]["quality"] = str(args.amf_qual).strip().lower()
+
+    print(
+        "Forced quality policy: "
+        f"NVENC preset={FORCED_QUALITY_POLICY['nvenc']['preset']}, "
+        f"QSV TU={FORCED_QUALITY_POLICY['qsv']['tu']}, "
+        f"AMF quality={FORCED_QUALITY_POLICY['amf']['quality']}"
+    )
+    if args.custom_params:
+        print("Manual injected command detected (--custom-params): full manual params take precedence.")
 
     # handle query-only case
     if args.query_params and not args.src and not args.work:
@@ -825,19 +850,20 @@ EXAMPLES:
     suffixes = [s for s in (x.strip() for x in args.suffixes.split(",") if x.strip())] if args.suffixes else []
 
     def make_task(srcp: Path, outp: Path, group_id, opts: dict, custom_params=None, encoder_label=None, ffmpeg_cmds=None, src_duration_sec=None):
-        cmd = build_ffmpeg_cmd(srcp, outp, opts or {}, custom_params=custom_params)
+        opts_local = dict(opts or {})
+        cmd = build_ffmpeg_cmd(srcp, outp, opts_local, custom_params=custom_params)
         task = {
             "src": str(srcp),
             "dst": str(outp),
             "group": group_id,
-            "encoder": encoder_label if encoder_label is not None else (opts or {}).get("encoder", ""),
-            "codec": (opts or {}).get("codec", ""),
-            "preset": (opts or {}).get("preset", ""),
-            "rc_mode": (opts or {}).get("rc_mode", ""),
-            "br_min": (opts or {}).get("br_min", ""),
-            "br_max": (opts or {}).get("br_max", ""),
-            "cqp": (opts or {}).get("cqp", ""),
-            "opts": opts or {},
+            "encoder": encoder_label if encoder_label is not None else opts_local.get("encoder", ""),
+            "codec": opts_local.get("codec", ""),
+            "preset": opts_local.get("preset", ""),
+            "rc_mode": opts_local.get("rc_mode", ""),
+            "br_min": opts_local.get("br_min", ""),
+            "br_max": opts_local.get("br_max", ""),
+            "cqp": opts_local.get("cqp", ""),
+            "opts": opts_local,
             "custom_params": custom_params,
             "ffmpeg_cmd": cmd,
             "src_duration_sec": src_duration_sec,
