@@ -359,10 +359,10 @@ def _normalize_sw_fallback_opts(opts: dict):
     return sw
 
 
-def _strip_conflicting_quality_tokens(tokens, encoder: str):
+def _strip_conflicting_quality_tokens(tokens, encoder: str, manual_override=False):
     """Remove tokens that conflict with forced HW quality policy."""
     remove_keys = {"-preset", "-quality", "-tu"}
-    if encoder not in {"nvenc", "qsv", "amf"}:
+    if encoder not in {"nvenc", "qsv", "amf"} or manual_override:
         return tokens
     out = []
     i = 0
@@ -376,7 +376,9 @@ def _strip_conflicting_quality_tokens(tokens, encoder: str):
     return out
 
 
-def _forced_quality_args(encoder: str):
+def _forced_quality_args(encoder: str, manual_override=False):
+    if manual_override:
+        return []
     if encoder == "nvenc":
         return ["-preset", FORCED_QUALITY_POLICY["nvenc"]["preset"]]
     if encoder == "qsv":
@@ -502,9 +504,14 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             cmd += ["-qp", str(cqp)]
         elif rc=="vbr" and br_min:
             cmd += ["-b:v", human_bitrate(br_min)]
+    manual_quality_override = bool(opts.get("manual_quality_override", False))
     if opts.get("extra"):
-        cmd += _strip_conflicting_quality_tokens(shlex.split(opts.get("extra")), opts.get("encoder"))
-    cmd += _forced_quality_args(opts.get("encoder"))
+        cmd += _strip_conflicting_quality_tokens(
+            shlex.split(opts.get("extra")),
+            opts.get("encoder"),
+            manual_override=manual_quality_override,
+        )
+    cmd += _forced_quality_args(opts.get("encoder"), manual_override=manual_quality_override)
     cmd += [str(output_path)]
     return cmd
 
