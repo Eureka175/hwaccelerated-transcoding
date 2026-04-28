@@ -139,6 +139,26 @@ def suggest_bitrate_range(width, height):
     if long_side and long_side >= 1920:
         return (10, 20)
     return (5, 10)
+
+def suggest_cqp(width, height):
+    """Suggest CQP/CRF by long side for quality-first encoding."""
+    candidates = [x for x in (width, height) if isinstance(x, (int, float))]
+    long_side = max(candidates) if candidates else None
+    if long_side and long_side >= 3840:
+        return 20
+    if long_side and long_side >= 1920:
+        return 22
+    return 24
+
+def suggest_maxrate(width, height):
+    """Hard-capped maxrate by long side (safety valve for CQP/CRF)."""
+    candidates = [x for x in (width, height) if isinstance(x, (int, float))]
+    long_side = max(candidates) if candidates else None
+    if long_side and long_side >= 3840:
+        return 50
+    if long_side and long_side >= 1920:
+        return 30
+    return 15
 # ---------------- query encoder ----------------
 def query_encoder(backend: str, work: Path):
     mapping = {"nvenc":["h264_nvenc","hevc_nvenc"], "qsv":["h264_qsv","hevc_qsv"], "amf":["h264_amf","hevc_amf"]}
@@ -235,6 +255,48 @@ def _probe_streams(input_path: Path):
         return (json.loads(out) or {}).get("streams", []) or []
     except Exception:
         return []
+
+
+def _probe_primary_audio_info(input_path: Path):
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name,bit_rate:format=duration",
+        "-of", "json", str(input_path)
+    ]
+    rc, out = run_cmd_capture(cmd)
+    if rc != 0 or not out:
+        return {}
+    try:
+        obj = json.loads(out) or {}
+    except Exception:
+        return {}
+    streams = obj.get("streams") or []
+    stream0 = streams[0] if streams else {}
+    fmt = obj.get("format") or {}
+    return {
+        "codec_name": str(stream0.get("codec_name") or "").lower(),
+        "bit_rate": _safe_float(stream0.get("bit_rate")),
+        "duration": _safe_float(fmt.get("duration")),
+    }
+
+
+def _needs_pcm_safety_reencode(input_path: Path, output_path: Path):
+    """
+    避免超长素材里 PCM 直拷导致音频数据超过 4GiB 触发封装失败。
+    策略：仅对 MOV + PCM 进行检查，估算音频大小超阈值时改为 AAC。
+    """
+    if output_path.suffix.lower() != ".mov":
+        return False
+    info = _probe_primary_audio_info(input_path)
+    codec = info.get("codec_name", "")
+    if not codec.startswith("pcm_"):
+        return False
+    br = info.get("bit_rate")
+    dur = info.get("duration")
+    if not br or not dur:
+        return False
+    estimated_bytes = (br / 8.0) * dur
+    return estimated_bytes >= (4 * 1024 * 1024 * 1024)
 
 
 def _should_force_mov_output(input_path: Path):
@@ -417,10 +479,12 @@ def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
     return args
 
 
-def _audio_codec_args_for_output(output_path: Path):
-    """MP4 audio -> AAC 320k (preserve channel layout by not forcing -ac); MOV audio -> copy."""
+def _audio_codec_args_for_output(input_path: Path, output_path: Path):
+    """MP4 audio -> AAC 320k; MOV audio -> copy (超大 PCM 自动转 AAC 规避 >4GiB 风险)。"""
     ext = output_path.suffix.lower()
     if ext == ".mov":
+        if _needs_pcm_safety_reencode(input_path, output_path):
+            return ["-c:a", "aac", "-b:a", "320k"]
         return ["-c:a", "copy"]
     if ext == ".mp4":
         return ["-c:a", "aac", "-b:a", "320k"]
@@ -455,7 +519,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
         # 外部透传参数模式：保持用户参数原样，不做内部策略改写。
         return base + shlex.split(custom_params) + [str(output_path)]
     cmd = base.copy() + copy_meta_args
-    cmd += _audio_codec_args_for_output(output_path)
+    cmd += _audio_codec_args_for_output(input_path, output_path)
     cmd += _extra_stream_codec_args_for_output(output_path)
     # scale
     scale = opts.get("scale")
@@ -501,7 +565,10 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             cmd += ["-rc","constqp","-qp", str(cqp)]
     else:
         if rc=="cqp" and cqp is not None:
-            cmd += ["-qp", str(cqp)]
+            # software encoders prefer CRF semantics over fixed QP for practical VOD use
+            cmd += ["-crf", str(cqp)]
+            if br_max:
+                cmd += ["-maxrate", human_bitrate(br_max), "-bufsize", human_bitrate(br_max*2)]
         elif rc=="vbr" and br_min:
             cmd += ["-b:v", human_bitrate(br_min)]
     manual_quality_override = bool(opts.get("manual_quality_override", False))
@@ -986,7 +1053,7 @@ EXAMPLES:
                 "-an","-f","null",null_sink]
         cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp)]
         cmd2 += _stream_copy_and_metadata_args(srcp, outp)
-        cmd2 += _audio_codec_args_for_output(outp)
+        cmd2 += _audio_codec_args_for_output(srcp, outp)
         cmd2 += _extra_stream_codec_args_for_output(outp)
         cmd2 += ["-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
                 "-x265-params","rc-lookahead=60:aq-mode=3:aq-strength=0.9:psy-rd=2.0","-passlogfile",str(passlog),
@@ -1048,9 +1115,14 @@ EXAMPLES:
             for g in groups:
                 w,h = g["width"], g["height"]
                 br_min, br_max = suggest_bitrate_range(w, h)
+                cqp_sugg = suggest_cqp(w, h)
+                maxrate_sugg = suggest_maxrate(w, h)
+                rc_mode = args.rc_mode or "vbr"
+                resolved_br_max = args.max_br or (maxrate_sugg if rc_mode == "cqp" else br_max)
                 cfg = {"encoder": args.encoder if not args.skip_hwaccel else args.encoder, "codec": args.codec,
-                       "rc_mode": args.rc_mode or "vbr", "preset": args.preset, "br_min": args.min_br or br_min, "br_max": args.max_br or br_max,
-                       "cqp": args.cqp, "audio_bitrate":320, "scale":"same", "extra":""}
+                       "rc_mode": rc_mode, "preset": args.preset, "br_min": args.min_br or br_min, "br_max": resolved_br_max,
+                       "cqp": args.cqp if args.cqp is not None else (cqp_sugg if rc_mode == "cqp" else None),
+                       "audio_bitrate":320, "scale":"same", "extra":""}
                 # skip specifics: if skip-bitrate then keep br_min/br_max as suggested; if skip-res skip scale edit (we already not interactive)
                 group_configs[g["group_id"]] = cfg
             # print summary
@@ -1066,18 +1138,23 @@ EXAMPLES:
                 gid = g["group_id"]
                 w,h = g["width"], g["height"]
                 br_sugg = suggest_bitrate_range(w, h)
+                cqp_sugg = suggest_cqp(w, h)
+                maxrate_sugg = suggest_maxrate(w, h)
                 print(f"\nGroup {gid}: {w}x{h} @ {g['fps']} fps  files:{len(g['files'])}")
                 print(f"Suggested bitrate: {br_sugg[0]}-{br_sugg[1]} Mbps")
                 enc = input(f"  encoder [{args.encoder}]: ").strip() or args.encoder
                 codec = input(f"  codec [{args.codec}]: ").strip() or args.codec
                 rc = input(f"  rc_mode [vbr]: ").strip() or "vbr"
                 preset = input(f"  preset [{args.preset or ''}]: ").strip() or args.preset
-                brmin = input(f"  br_min ({br_sugg[0]}): ").strip()
-                brmax = input(f"  br_max ({br_sugg[1]}): ").strip()
-                brmin = float(brmin) if brmin else br_sugg[0]
-                brmax = float(brmax) if brmax else br_sugg[1]
-                cqp = input("  cqp (leave empty if none): ").strip()
-                cqp = int(cqp) if cqp else None
+                brmin_default = br_sugg[0]
+                brmax_default = maxrate_sugg if rc == "cqp" else br_sugg[1]
+                brmin = input(f"  br_min ({brmin_default}): ").strip()
+                brmax = input(f"  br_max ({brmax_default}): ").strip()
+                brmin = float(brmin) if brmin else brmin_default
+                brmax = float(brmax) if brmax else brmax_default
+                cqp_prompt_default = str(cqp_sugg) if rc == "cqp" else ""
+                cqp = input(f"  cqp/crf ({cqp_prompt_default or 'leave empty if none'}): ").strip()
+                cqp = int(cqp) if cqp else (cqp_sugg if rc == "cqp" else None)
                 scale = input("  scale (e.g. 1920x1080/half/same) [same]: ").strip() or "same"
                 group_configs[gid] = {"encoder":enc,"codec":codec,"rc_mode":rc,"preset":preset,"br_min":brmin,"br_max":brmax,"cqp":cqp,"audio_bitrate":320,"scale":scale,"extra":""}
         # build tasks from group_configs
