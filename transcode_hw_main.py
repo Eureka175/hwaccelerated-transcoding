@@ -304,7 +304,7 @@ def _should_force_mov_output(input_path: Path):
     streams = _probe_streams(input_path)
     if not streams:
         return False
-    data_tags = {"djmd", "dbgi", "tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
+    data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
     for st in streams:
         ctype = (st.get("codec_type") or "").lower()
         if ctype in {"data", "attachment"}:
@@ -317,7 +317,7 @@ def _should_force_mov_output(input_path: Path):
             return True
         tags = st.get("tags") or {}
         handler = str(tags.get("handler_name", "")).lower()
-        if any(k in handler for k in ["dji", "meta", "timecode"]):
+        if any(k in handler for k in ["meta", "timecode"]):
             return True
     return False
 
@@ -467,7 +467,7 @@ def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
 
     if ext == ".mp4":
         # Keep MP4-safe metadata-like data streams (e.g. tmcd timecode) but avoid private codecs that break muxing.
-        safe_data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd", "djmd", "dbgi"}
+        safe_data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
         for st in _probe_streams(input_path):
             if st.get("codec_type") != "data":
                 continue
@@ -1113,22 +1113,17 @@ EXAMPLES:
         if args.skip:
             # build suggested defaults and skip interactions according to skip flags
             for g in groups:
-                w,h = g["width"], g["height"]
-                br_min, br_max = suggest_bitrate_range(w, h)
-                cqp_sugg = suggest_cqp(w, h)
-                maxrate_sugg = suggest_maxrate(w, h)
-                rc_mode = args.rc_mode or "vbr"
-                resolved_br_max = args.max_br or (maxrate_sugg if rc_mode == "cqp" else br_max)
+                rc_mode = "cqp"
                 cfg = {"encoder": args.encoder if not args.skip_hwaccel else args.encoder, "codec": args.codec,
-                       "rc_mode": rc_mode, "preset": args.preset, "br_min": args.min_br or br_min, "br_max": resolved_br_max,
-                       "cqp": args.cqp if args.cqp is not None else (cqp_sugg if rc_mode == "cqp" else None),
+                       "rc_mode": rc_mode, "preset": args.preset, "br_min": None, "br_max": None,
+                       "cqp": 24,
                        "audio_bitrate":320, "scale":"same", "extra":""}
                 # skip specifics: if skip-bitrate then keep br_min/br_max as suggested; if skip-res skip scale edit (we already not interactive)
                 group_configs[g["group_id"]] = cfg
             # print summary
             print("Skip mode: will apply the following per-group configs (suggested):")
             for k,v in group_configs.items():
-                print(f"  Group {k}: encoder={v['encoder']}, codec={v['codec']}, rc={v['rc_mode']}, br={v['br_min']}-{v['br_max']}, preset={v['preset']}, scale={v['scale']}")
+                print(f"  Group {k}: encoder={v['encoder']}, codec={v['codec']}, rc={v['rc_mode']}, cqp={v['cqp']}, preset={v['preset']}, scale={v['scale']}")
             if not args.skip_builtin_checks:
                 c = input("Confirm and proceed? (y/N): ").strip().lower()
                 if c != "y": print("Aborted"); sys.exit(0)
@@ -1137,24 +1132,16 @@ EXAMPLES:
             for g in groups:
                 gid = g["group_id"]
                 w,h = g["width"], g["height"]
-                br_sugg = suggest_bitrate_range(w, h)
-                cqp_sugg = suggest_cqp(w, h)
-                maxrate_sugg = suggest_maxrate(w, h)
+                cqp_fixed = 24
                 print(f"\nGroup {gid}: {w}x{h} @ {g['fps']} fps  files:{len(g['files'])}")
-                print(f"Suggested bitrate: {br_sugg[0]}-{br_sugg[1]} Mbps")
+                print(f"Fixed CRF/CQ: {cqp_fixed}")
                 enc = input(f"  encoder [{args.encoder}]: ").strip() or args.encoder
                 codec = input(f"  codec [{args.codec}]: ").strip() or args.codec
-                rc = input(f"  rc_mode [vbr]: ").strip() or "vbr"
+                rc = "cqp"
                 preset = input(f"  preset [{args.preset or ''}]: ").strip() or args.preset
-                brmin_default = br_sugg[0]
-                brmax_default = maxrate_sugg if rc == "cqp" else br_sugg[1]
-                brmin = input(f"  br_min ({brmin_default}): ").strip()
-                brmax = input(f"  br_max ({brmax_default}): ").strip()
-                brmin = float(brmin) if brmin else brmin_default
-                brmax = float(brmax) if brmax else brmax_default
-                cqp_prompt_default = str(cqp_sugg) if rc == "cqp" else ""
-                cqp = input(f"  cqp/crf ({cqp_prompt_default or 'leave empty if none'}): ").strip()
-                cqp = int(cqp) if cqp else (cqp_sugg if rc == "cqp" else None)
+                brmin = None
+                brmax = None
+                cqp = cqp_fixed
                 scale = input("  scale (e.g. 1920x1080/half/same) [same]: ").strip() or "same"
                 group_configs[gid] = {"encoder":enc,"codec":codec,"rc_mode":rc,"preset":preset,"br_min":brmin,"br_max":brmax,"cqp":cqp,"audio_bitrate":320,"scale":scale,"extra":""}
         # build tasks from group_configs
