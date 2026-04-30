@@ -304,7 +304,7 @@ def _should_force_mov_output(input_path: Path):
     streams = _probe_streams(input_path)
     if not streams:
         return False
-    data_tags = {"djmd", "dbgi", "tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
+    data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
     for st in streams:
         ctype = (st.get("codec_type") or "").lower()
         if ctype in {"data", "attachment"}:
@@ -317,7 +317,7 @@ def _should_force_mov_output(input_path: Path):
             return True
         tags = st.get("tags") or {}
         handler = str(tags.get("handler_name", "")).lower()
-        if any(k in handler for k in ["dji", "meta", "timecode"]):
+        if any(k in handler for k in ["meta", "timecode"]):
             return True
     return False
 
@@ -467,7 +467,7 @@ def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
 
     if ext == ".mp4":
         # Keep MP4-safe metadata-like data streams (e.g. tmcd timecode) but avoid private codecs that break muxing.
-        safe_data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd", "djmd", "dbgi"}
+        safe_data_tags = {"tmcd", "gpmd", "camm", "mett", "metx", "rtmd"}
         for st in _probe_streams(input_path):
             if st.get("codec_type") != "data":
                 continue
