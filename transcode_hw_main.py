@@ -480,14 +480,7 @@ def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
 
 
 def _audio_codec_args_for_output(input_path: Path, output_path: Path):
-    """MP4 audio -> AAC 320k; MOV audio -> copy (超大 PCM 自动转 AAC 规避 >4GiB 风险)。"""
-    ext = output_path.suffix.lower()
-    if ext == ".mov":
-        if _needs_pcm_safety_reencode(input_path, output_path):
-            return ["-c:a", "aac", "-b:a", "320k"]
-        return ["-c:a", "copy"]
-    if ext == ".mp4":
-        return ["-c:a", "aac", "-b:a", "320k"]
+    """输出封装时始终直拷原始音频流。"""
     return ["-c:a", "copy"]
 
 
@@ -501,6 +494,70 @@ def _extra_stream_codec_args_for_output(output_path: Path):
         args += ["-c:t", "copy"]
     return args
 
+
+
+
+def _probe_audio_stream_brief(path: Path):
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index,codec_name,channels,sample_rate,channel_layout,bit_rate",
+        "-of", "json", str(path)
+    ]
+    rc, out = run_cmd_capture(cmd)
+    if rc != 0 or not out:
+        return []
+    try:
+        streams = (json.loads(out) or {}).get("streams", []) or []
+    except Exception:
+        return []
+    rows = []
+    for st in streams:
+        rows.append({
+            "index": st.get("index"),
+            "codec": str(st.get("codec_name") or "").lower(),
+            "channels": st.get("channels"),
+            "sample_rate": str(st.get("sample_rate") or ""),
+            "layout": str(st.get("channel_layout") or ""),
+            "bit_rate": str(st.get("bit_rate") or ""),
+        })
+    return rows
+
+
+def _audio_stream_hash(path: Path, stream_selector: str):
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(path),
+        "-map", stream_selector, "-c", "copy",
+        "-f", "hash", "-hash", "sha256", "-"
+    ]
+    rc, out = run_cmd_capture(cmd)
+    if rc != 0 or not out:
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("SHA256="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def compare_audio_streams(src_path: Path, dst_path: Path):
+    src_streams = _probe_audio_stream_brief(src_path)
+    dst_streams = _probe_audio_stream_brief(dst_path)
+    if len(src_streams) != len(dst_streams):
+        return False, f"audio-stream-count-mismatch: src={len(src_streams)} dst={len(dst_streams)}"
+    if not src_streams and not dst_streams:
+        return True, "no-audio-stream"
+
+    for i, (ss, ds) in enumerate(zip(src_streams, dst_streams)):
+        for k in ["codec", "channels", "sample_rate", "layout"]:
+            if str(ss.get(k)) != str(ds.get(k)):
+                return False, f"audio-meta-mismatch[{i}] {k}: src={ss.get(k)} dst={ds.get(k)}"
+        sh = _audio_stream_hash(src_path, f"0:a:{i}")
+        dh = _audio_stream_hash(dst_path, f"0:a:{i}")
+        if not sh or not dh:
+            return False, f"audio-hash-failed[{i}] src_hash={bool(sh)} dst_hash={bool(dh)}"
+        if sh != dh:
+            return False, f"audio-hash-mismatch[{i}]"
+    return True, "audio-identical"
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
     src_codec = _probe_video_codec_name(input_path)
@@ -893,6 +950,7 @@ EXAMPLES:
     groups_csv = work_root.joinpath("groups_summary.csv")
     pre_media_csv = work_root.joinpath("pre_media_info.csv")
     post_media_csv = work_root.joinpath("post_media_info.csv")
+    audio_verify_csv = work_root.joinpath("audio_verify.csv")
     tasks_json = work_root.joinpath("tasks_preflight.json")
     result_csv = work_root.joinpath("tasks_result.csv")
 
@@ -1184,7 +1242,22 @@ EXAMPLES:
         info = probe_media(dstp) or {"width":None,"height":None,"codec":"","fps":0.0,"duration":"","bitrate":""}
         out_entries.append({"path":str(dstp),"width":info["width"],"height":info["height"],"fps":info["fps"],"codec":info["codec"],"duration":info.get("duration"),"bitrate":info.get("bitrate")})
     write_csv(post_media_csv, ["path","width","height","fps","codec","duration","bitrate"], out_entries)
+
+    audio_rows = []
+    all_audio_ok = True
+    for t in tasks:
+        srcp = Path(t["src"])
+        dstp = Path(t["dst"])
+        ok, note = compare_audio_streams(srcp, dstp)
+        if not ok:
+            all_audio_ok = False
+        audio_rows.append({"src": str(srcp), "dst": str(dstp), "audio_match": int(bool(ok)), "note": note})
+    write_csv(audio_verify_csv, ["src", "dst", "audio_match", "note"], audio_rows)
+
     print("Post media info written to:", post_media_csv)
+    print("Audio verify report written to:", audio_verify_csv)
+    if not all_audio_ok:
+        print("Warning: some output audio streams differ from source. See:", audio_verify_csv)
     print("Done. Results:", result_csv)
 
 if __name__ == "__main__":
