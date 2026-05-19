@@ -559,6 +559,17 @@ def compare_audio_streams(src_path: Path, dst_path: Path):
             return False, f"audio-hash-mismatch[{i}]"
     return True, "audio-identical"
 
+def verify_audio_presence_for_retry(src_path: Path, dst_path: Path):
+    """AAC 重试后仅校验音频流数量与基础参数，避免再次做 bit-exact 比对。"""
+    src_streams = _probe_audio_stream_brief(src_path)
+    dst_streams = _probe_audio_stream_brief(dst_path)
+    if len(src_streams) != len(dst_streams):
+        return False, f"audio-stream-count-mismatch: src={len(src_streams)} dst={len(dst_streams)}"
+    for i, ds in enumerate(dst_streams):
+        if ds.get("codec") != "aac":
+            return False, f"aac-retry-codec-mismatch[{i}]: {ds.get('codec')}"
+    return True, "aac-retry-ok"
+
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
     src_codec = _probe_video_codec_name(input_path)
     hw_scale_vf = _resolve_hw_scale_filter(opts.get("encoder"), opts.get("scale"))
@@ -636,6 +647,30 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             manual_override=manual_quality_override,
         )
     cmd += _forced_quality_args(opts.get("encoder"), manual_override=manual_quality_override)
+    cmd += [str(output_path)]
+    return cmd
+
+
+def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: Path, audio_mode="copy"):
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
+        "-i", str(video_only_path), "-i", str(audio_source_path),
+        "-map_metadata", "0", "-map_chapters", "0",
+        "-copy_unknown",
+        "-map", "0:v:0",
+        "-map", "1:a?",
+        "-map", "0:s?",
+        "-map", "0:d?",
+        "-map", "0:t?",
+        "-c:v", "copy",
+        "-c:s", "copy",
+        "-c:d", "copy",
+        "-c:t", "copy",
+    ]
+    if audio_mode == "aac320k":
+        cmd += ["-c:a", "aac", "-b:a", "320k"]
+    else:
+        cmd += ["-c:a", "copy"]
     cmd += [str(output_path)]
     return cmd
 
@@ -763,7 +798,22 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
     primary_log = logs_root.joinpath(rel).with_suffix(".log")
     primary_log.parent.mkdir(parents=True, exist_ok=True)
 
-    cmds = task.get("ffmpeg_cmds") or [task["ffmpeg_cmd"]]
+    if task.get("custom_params"):
+        cmds = task.get("ffmpeg_cmds") or [task["ffmpeg_cmd"]]
+    else:
+        srcp = Path(task["src"])
+        dstp = Path(task["dst"])
+        tmp_video = dstp.with_name(dstp.stem + ".video_only" + dstp.suffix)
+        tmp_audio = dstp.with_name(dstp.stem + ".audio_only.mka")
+        opts_for_video = dict(task.get("opts") or {})
+        opts_for_video["extra"] = (opts_for_video.get("extra", "") + " -an").strip()
+        video_cmd = build_ffmpeg_cmd(srcp, tmp_video, opts_for_video, custom_params=None)
+        extract_audio_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
+            "-i", str(srcp), "-map", "0:a?", "-c:a", "copy", str(tmp_audio)
+        ]
+        mux_copy_cmd = build_mux_cmd(tmp_video, tmp_audio, dstp, audio_mode="copy")
+        cmds = [extract_audio_cmd, video_cmd, mux_copy_cmd]
     total_dur = 0.0
     rc = 0
     note = ""
@@ -788,9 +838,13 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
     # Robust fallback: hw encoder failed -> retry once with software encoder.
     if STOP_EVENT.is_set() or rc == 130:
         return 130, "interrupted", total_dur, used_cmd, used_log
-    if rc != 0 and task.get("encoder") in {"nvenc", "qsv", "amf"} and not task.get("custom_params") and len(cmds) == 1:
+    if rc != 0 and task.get("encoder") in {"nvenc", "qsv", "amf"} and not task.get("custom_params"):
         sw_opts = _normalize_sw_fallback_opts(task.get("opts", {}))
-        fallback_cmd = build_ffmpeg_cmd(Path(task["src"]), Path(task["dst"]), sw_opts, custom_params=None)
+        dstp = Path(task["dst"])
+        srcp = Path(task["src"])
+        tmp_video = dstp.with_name(dstp.stem + ".video_only" + dstp.suffix)
+        sw_opts["extra"] = (sw_opts.get("extra", "") + " -an").strip()
+        fallback_cmd = build_ffmpeg_cmd(srcp, tmp_video, sw_opts, custom_params=None)
         fallback_log = primary_log.with_name(primary_log.stem + ".fallback.log")
         rc2, note2, dur2 = _run_and_log(
             fallback_cmd,
@@ -802,8 +856,42 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
         )
         total_dur += dur2
         if rc2 == 0:
-            return rc2, f"fallback-ok: {task.get('encoder')} -> cpu", total_dur, fallback_cmd, fallback_log
+            mux_copy_cmd = build_mux_cmd(tmp_video, dstp.with_name(dstp.stem + ".audio_only.mka"), dstp, audio_mode="copy")
+            rc3, note3, dur3 = _run_and_log(
+                mux_copy_cmd,
+                primary_log.with_name(primary_log.stem + ".fallback_mux.log"),
+                timeout,
+                task_label=Path(task["src"]).name + "(fallback-mux)",
+                src_duration=task.get("src_duration_sec"),
+                show_progress=show_progress,
+            )
+            total_dur += dur3
+            if rc3 == 0:
+                return rc3, f"fallback-ok: {task.get('encoder')} -> cpu", total_dur, mux_copy_cmd, fallback_log
+            return rc3, f"fallback-video-ok-but-mux-failed: {note3}", total_dur, mux_copy_cmd, fallback_log
         return rc2, f"fallback-failed: primary={rc} secondary={rc2}; {note2 or note}", total_dur, fallback_cmd, fallback_log
+
+    if rc == 0 and not task.get("custom_params"):
+        srcp = Path(task["src"])
+        dstp = Path(task["dst"])
+        ok, verify_note = compare_audio_streams(srcp, dstp)
+        if ok:
+            return rc, f"{note}; audio-verify={verify_note}" if note else f"audio-verify={verify_note}", total_dur, used_cmd, used_log
+        retry_cmd = build_mux_cmd(dstp.with_name(dstp.stem + ".video_only" + dstp.suffix), srcp, dstp, audio_mode="aac320k")
+        retry_log = primary_log.with_name(primary_log.stem + ".audio_retry_aac.log")
+        rc_retry, note_retry, dur_retry = _run_and_log(
+            retry_cmd, retry_log, timeout,
+            task_label=Path(task["src"]).name + "(audio-retry)",
+            src_duration=task.get("src_duration_sec"),
+            show_progress=show_progress,
+        )
+        total_dur += dur_retry
+        if rc_retry != 0:
+            return rc_retry, f"audio-verify-failed({verify_note}); aac-retry-failed: {note_retry}", total_dur, retry_cmd, retry_log
+        ok2, note2 = verify_audio_presence_for_retry(srcp, dstp)
+        if not ok2:
+            return 65, f"audio-verify-failed({verify_note}); aac-retry-invalid({note2})", total_dur, retry_cmd, retry_log
+        return 0, f"audio-verify-failed({verify_note}); aac-retry-ok", total_dur, retry_cmd, retry_log
 
     return rc, note, total_dur, used_cmd, used_log
 
