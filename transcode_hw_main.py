@@ -559,7 +559,6 @@ def compare_audio_streams(src_path: Path, dst_path: Path):
             return False, f"audio-hash-mismatch[{i}]"
     return True, "audio-identical"
 
-
 def verify_audio_presence_for_retry(src_path: Path, dst_path: Path):
     """AAC 重试后仅校验音频流数量与基础参数，避免再次做 bit-exact 比对。"""
     src_streams = _probe_audio_stream_brief(src_path)
