@@ -683,6 +683,18 @@ def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: P
     return cmd
 
 # ---------------- utility: output path handling ----------------
+def _default_output_suffix_for_source(src: Path):
+    """
+    默认输出容器策略：
+    - 输入为 mp4/mov 时保持同容器；
+    - 其他容器默认输出 mp4。
+    """
+    ext = src.suffix.lower()
+    if ext in {".mp4", ".mov"}:
+        return ext
+    return ".mp4"
+
+
 def make_output_path(src: Path, src_root: Path, dst_root: Path, flat_output=False, out_suffix=None):
     name = src.stem
     parent = src.parent
@@ -690,7 +702,7 @@ def make_output_path(src: Path, src_root: Path, dst_root: Path, flat_output=Fals
         name_out = f"{name}{out_suffix}"
     else:
         name_out = name
-    ext = ".mov"
+    ext = _default_output_suffix_for_source(src)
     if flat_output:
         # put everything directly in dst_root; if name collision, append parent dir name
         dst_root.mkdir(parents=True, exist_ok=True)
