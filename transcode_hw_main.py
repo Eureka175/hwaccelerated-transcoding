@@ -752,18 +752,23 @@ def _run_and_log(cmd, logp: Path, timeout=None, task_label="", src_duration=None
     last_progress_print = 0.0
     with logp.open("wb") as f:
         try:
-            for chunk in p.stdout:
+            text_buf = ""
+            while True:
                 if STOP_EVENT.is_set():
                     p.kill()
                     return 130, "interrupted", round(time.time()-start,1)
-                if chunk is None: continue
+                chunk = p.stdout.read(4096)
+                if not chunk:
+                    break
                 f.write(chunk)
                 if show_progress:
-                    try:
-                        line = chunk.decode(errors="ignore").strip()
-                    except Exception:
-                        line = ""
-                    if "time=" in line:
+                    text_buf += chunk.decode(errors="ignore")
+                    parts = text_buf.replace("\r", "\n").split("\n")
+                    text_buf = parts[-1]
+                    for line in parts[:-1]:
+                        line = line.strip()
+                        if "time=" not in line:
+                            continue
                         idx = line.find("time=")
                         tval = line[idx+5:].split()[0]
                         now = time.time()
