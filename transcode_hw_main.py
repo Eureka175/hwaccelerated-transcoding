@@ -677,6 +677,17 @@ def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: P
     cmd += [str(output_path)]
     return cmd
 
+
+def build_audio_extract_cmd(src_path: Path, audio_only_path: Path):
+    return [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
+        "-i", str(src_path),
+        "-vn", "-sn", "-dn",
+        "-map", "0:a:0?",
+        "-c:a", "aac", "-b:a", "320k",
+        str(audio_only_path),
+    ]
+
 # ---------------- utility: output path handling ----------------
 def _default_output_suffix_for_source(src: Path):
     """
@@ -844,10 +855,7 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
             opts_for_video = dict(task.get("opts") or {})
             opts_for_video["extra"] = (opts_for_video.get("extra", "") + " -an").strip()
             video_cmd = build_ffmpeg_cmd(srcp, tmp_video, opts_for_video, custom_params=None)
-            extract_audio_cmd = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
-                "-i", str(srcp), "-map", "0:a?", "-c:a", "copy", str(tmp_audio)
-            ]
+            extract_audio_cmd = build_audio_extract_cmd(srcp, tmp_audio)
             mux_copy_cmd = build_mux_cmd(tmp_video, tmp_audio, dstp, audio_mode=_default_mux_audio_mode(srcp, dstp))
             cmds = [extract_audio_cmd, video_cmd, mux_copy_cmd]
     total_dur = 0.0
@@ -899,6 +907,18 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
                 fallback_audio = dstp.with_name(dstp.stem + ".audio_only.mka")
                 if fallback_audio not in temp_files:
                     temp_files.append(fallback_audio)
+                extract_audio_cmd = build_audio_extract_cmd(srcp, fallback_audio)
+                rc_audio, note_audio, dur_audio = _run_and_log(
+                    extract_audio_cmd,
+                    primary_log.with_name(primary_log.stem + ".fallback_audio.log"),
+                    timeout,
+                    task_label=Path(task["src"]).name + "(fallback-audio)",
+                    src_duration=task.get("src_duration_sec"),
+                    show_progress=show_progress,
+                )
+                total_dur += dur_audio
+                if rc_audio != 0:
+                    return _ret(rc_audio, f"fallback-audio-failed: {note_audio}", total_dur, extract_audio_cmd, fallback_log)
                 mux_copy_cmd = build_mux_cmd(
                     tmp_video,
                     fallback_audio,
