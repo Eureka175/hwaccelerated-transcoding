@@ -611,15 +611,21 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     # rc
     rc = opts.get("rc_mode","vbr"); br_min=opts.get("br_min"); br_max=opts.get("br_max"); cqp=opts.get("cqp")
     if "nvenc" in enc:
-        if rc=="vbr":
-            if br_min: cmd += ["-rc","vbr","-b:v", human_bitrate(br_min)]
-            if br_max: cmd += ["-maxrate", human_bitrate(br_max), "-bufsize", human_bitrate(br_max*2)]
-        elif rc=="cbr":
-            if br_min: cmd += ["-rc","cbr","-b:v", human_bitrate(br_min)]
-        elif rc=="cqp" and cqp is not None:
-            cmd += ["-rc","constqp","-qp", str(cqp)]
-        elif rc=="icq" and cqp is not None:
-            cmd += ["-rc","vbr","-cq", str(cqp)]
+        # NVENC fixed policy:
+        # -c:v hevc_nvenc -preset p7 -tune hq -rc vbr -cq 22 -b:v 0
+        # -spatial_aq 1 -temporal_aq 1 -rc-lookahead 60 -bf 4 -b_ref_mode middle
+        cmd += [
+            "-preset", "p7",
+            "-tune", "hq",
+            "-rc", "vbr",
+            "-cq", "22",
+            "-b:v", "0",
+            "-spatial_aq", "1",
+            "-temporal_aq", "1",
+            "-rc-lookahead", "60",
+            "-bf", "4",
+            "-b_ref_mode", "middle",
+        ]
     elif "qsv" in enc:
         if rc=="vbr":
             if br_min: cmd += ["-rc","vbr","-b:v", human_bitrate(br_min)]
