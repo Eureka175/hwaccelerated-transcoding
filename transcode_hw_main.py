@@ -480,19 +480,13 @@ def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
 
 
 def _audio_codec_args_for_output(input_path: Path, output_path: Path):
-    """按容器选择音频策略：MP4 使用 AAC 320k，其他容器默认 copy。"""
-    if output_path.suffix.lower() == ".mp4":
-        return ["-c:a", "aac", "-b:a", "320k"]
-    return ["-c:a", "copy"]
+    """统一音频策略：全部转码为 AAC 320k。"""
+    return ["-c:a", "aac", "-b:a", "320k"]
 
 
 def _default_mux_audio_mode(input_path: Path, output_path: Path):
-    """默认混流音频模式：MP4 走 AAC，其他容器走 copy。"""
-    if output_path.suffix.lower() == ".mp4":
-        return "aac320k"
-    if _needs_pcm_safety_reencode(input_path, output_path):
-        return "aac320k"
-    return "copy"
+    """默认混流音频模式：统一 AAC 320k。"""
+    return "aac320k"
 
 
 def _extra_stream_codec_args_for_output(output_path: Path):
@@ -572,7 +566,7 @@ def compare_audio_streams(src_path: Path, dst_path: Path):
 
 
 def verify_audio_presence_for_retry(src_path: Path, dst_path: Path):
-    """AAC 重试后仅校验音频流数量与基础参数，避免再次做 bit-exact 比对。"""
+    """校验转码后音频流数量与 AAC 编码结果。"""
     src_streams = _probe_audio_stream_brief(src_path)
     dst_streams = _probe_audio_stream_brief(dst_path)
     if len(src_streams) != len(dst_streams):
@@ -663,7 +657,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     return cmd
 
 
-def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: Path, audio_mode="copy"):
+def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: Path, audio_mode="aac320k"):
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
         "-i", str(video_only_path), "-i", str(audio_source_path),
@@ -679,12 +673,20 @@ def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: P
         "-c:d", "copy",
         "-c:t", "copy",
     ]
-    if audio_mode == "aac320k":
-        cmd += ["-c:a", "aac", "-b:a", "320k"]
-    else:
-        cmd += ["-c:a", "copy"]
+    cmd += ["-c:a", "aac", "-b:a", "320k"]
     cmd += [str(output_path)]
     return cmd
+
+
+def build_audio_extract_cmd(src_path: Path, audio_only_path: Path):
+    return [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
+        "-i", str(src_path),
+        "-vn", "-sn", "-dn",
+        "-map", "0:a:0?",
+        "-c:a", "aac", "-b:a", "320k",
+        str(audio_only_path),
+    ]
 
 # ---------------- utility: output path handling ----------------
 def _default_output_suffix_for_source(src: Path):
@@ -853,10 +855,7 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
             opts_for_video = dict(task.get("opts") or {})
             opts_for_video["extra"] = (opts_for_video.get("extra", "") + " -an").strip()
             video_cmd = build_ffmpeg_cmd(srcp, tmp_video, opts_for_video, custom_params=None)
-            extract_audio_cmd = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
-                "-i", str(srcp), "-map", "0:a?", "-c:a", "copy", str(tmp_audio)
-            ]
+            extract_audio_cmd = build_audio_extract_cmd(srcp, tmp_audio)
             mux_copy_cmd = build_mux_cmd(tmp_video, tmp_audio, dstp, audio_mode=_default_mux_audio_mode(srcp, dstp))
             cmds = [extract_audio_cmd, video_cmd, mux_copy_cmd]
     total_dur = 0.0
@@ -908,6 +907,18 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
                 fallback_audio = dstp.with_name(dstp.stem + ".audio_only.mka")
                 if fallback_audio not in temp_files:
                     temp_files.append(fallback_audio)
+                extract_audio_cmd = build_audio_extract_cmd(srcp, fallback_audio)
+                rc_audio, note_audio, dur_audio = _run_and_log(
+                    extract_audio_cmd,
+                    primary_log.with_name(primary_log.stem + ".fallback_audio.log"),
+                    timeout,
+                    task_label=Path(task["src"]).name + "(fallback-audio)",
+                    src_duration=task.get("src_duration_sec"),
+                    show_progress=show_progress,
+                )
+                total_dur += dur_audio
+                if rc_audio != 0:
+                    return _ret(rc_audio, f"fallback-audio-failed: {note_audio}", total_dur, extract_audio_cmd, fallback_log)
                 mux_copy_cmd = build_mux_cmd(
                     tmp_video,
                     fallback_audio,
@@ -936,29 +947,10 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
     if rc == 0 and not task.get("custom_params"):
         srcp = Path(task["src"])
         dstp = Path(task["dst"])
-        if dstp.suffix.lower() == ".mp4":
-            ok_mp4, note_mp4 = verify_audio_presence_for_retry(srcp, dstp)
-            if not ok_mp4:
-                return _ret(65, f"mp4-audio-verify-failed({note_mp4})", total_dur, used_cmd, used_log)
-            return _ret(0, f"audio-verify={note_mp4}", total_dur, used_cmd, used_log)
-        ok, verify_note = compare_audio_streams(srcp, dstp)
-        if ok:
-            return _ret(rc, f"{note}; audio-verify={verify_note}" if note else f"audio-verify={verify_note}", total_dur, used_cmd, used_log)
-        retry_cmd = build_mux_cmd(dstp.with_name(dstp.stem + ".video_only" + dstp.suffix), srcp, dstp, audio_mode="aac320k")
-        retry_log = primary_log.with_name(primary_log.stem + ".audio_retry_aac.log")
-        rc_retry, note_retry, dur_retry = _run_and_log(
-            retry_cmd, retry_log, timeout,
-            task_label=Path(task["src"]).name + "(audio-retry)",
-            src_duration=task.get("src_duration_sec"),
-            show_progress=show_progress,
-        )
-        total_dur += dur_retry
-        if rc_retry != 0:
-            return _ret(rc_retry, f"audio-verify-failed({verify_note}); aac-retry-failed: {note_retry}", total_dur, retry_cmd, retry_log)
-        ok2, note2 = verify_audio_presence_for_retry(srcp, dstp)
-        if not ok2:
-            return _ret(65, f"audio-verify-failed({verify_note}); aac-retry-invalid({note2})", total_dur, retry_cmd, retry_log)
-        return _ret(0, f"audio-verify-failed({verify_note}); aac-retry-ok", total_dur, retry_cmd, retry_log)
+        ok, note_audio = verify_audio_presence_for_retry(srcp, dstp)
+        if not ok:
+            return _ret(65, f"audio-verify-failed({note_audio})", total_dur, used_cmd, used_log)
+        return _ret(0, f"audio-verify={note_audio}", total_dur, used_cmd, used_log)
 
     return _ret(rc, note, total_dur, used_cmd, used_log)
 
