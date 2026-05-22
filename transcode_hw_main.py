@@ -669,7 +669,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     return cmd
 
 
-def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: Path, audio_mode="copy"):
+def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: Path, audio_mode="aac320k"):
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
         "-i", str(video_only_path), "-i", str(audio_source_path),
