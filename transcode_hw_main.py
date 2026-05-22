@@ -612,29 +612,28 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     rc = opts.get("rc_mode","vbr"); br_min=opts.get("br_min"); br_max=opts.get("br_max"); cqp=opts.get("cqp")
     if "nvenc" in enc:
         # NVENC fixed policy:
-        # -c:v hevc_nvenc -preset p7 -tune uhq
-        # -rc vbr -cq 22 -b:v 0 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
-        # -rc-lookahead 64 -bf 4 -b_ref_mode middle -multipass fullres
-        # -g 240 -keyint_min 24 -weighted_pred 1
-        # -lookahead_level auto -surfaces 64
+        # -c:v hevc_nvenc -profile:v rext -preset p7 -tune uhq
+        # -rc vbr -cq 18 -b:v 0 -spatial_aq 1 -aq-strength 15 -temporal_aq 1
+        # -rc-lookahead 64 -lookahead_level auto
+        # -bf 4 -b_ref_mode middle -multipass fullres
+        # -g 240 -keyint_min 24
         cmd += [
+            "-profile:v", "rext",
             "-preset", "p7",
             "-tune", "uhq",
             "-rc", "vbr",
-            "-cq", "22",
+            "-cq", "18",
             "-b:v", "0",
             "-spatial_aq", "1",
-            "-aq-strength", "12",
+            "-aq-strength", "15",
             "-temporal_aq", "1",
             "-rc-lookahead", "64",
+            "-lookahead_level", "auto",
             "-bf", "4",
             "-b_ref_mode", "middle",
             "-multipass", "fullres",
             "-g", "240",
             "-keyint_min", "24",
-            "-weighted_pred", "1",
-            "-lookahead_level", "auto",
-            "-surfaces", "64",
         ]
     elif "qsv" in enc:
         if rc=="vbr":
