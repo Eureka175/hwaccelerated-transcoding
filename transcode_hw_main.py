@@ -30,9 +30,9 @@ DEFAULT_FORCED_QUALITY_POLICY = {
 FORCED_QUALITY_POLICY = json.loads(json.dumps(DEFAULT_FORCED_QUALITY_POLICY))
 # ---------------- presets ----------------
 PRESETS_INFO = OrderedDict([
-    ("preset1", {"name":"4k_prog_archive_1pass", "desc":"HEVC NVENC@P7, 1pass, vbr_hq(30/40), main10 p010, aq+lookahead"}),
+    ("preset1", {"name":"4k_prog_archive_1pass", "desc":"HEVC NVENC@P7, tune uhq, VBR CQ22, main10 p010, multipass+AQ+lookahead"}),
     ("preset2", {"name":"1080p_prog_rel_1pass", "desc":"HEVC QSV@TU1, 1pass, VBR(6/8), lookahead, aac@320k"}),
-    ("preset3", {"name":"4k_prog_archive_2pass", "desc":"HEVC NVENC@P7, multipass fullres, vbr_hq(30/40)"}),
+    ("preset3", {"name":"4k_prog_archive_2pass", "desc":"HEVC NVENC@P7, tune uhq, VBR CQ22, multipass fullres, AQ+lookahead"}),
     ("preset4", {"name":"1080p_prog_rel_2pass", "desc":"HEVC x265 slow, 2pass @6M"}),
     ("preset5", {"name":"fast_proxy_gen_halfres_avc_5m", "desc":"AVC NVENC(强制P7), tune ll, CBR 5M, half res, aac@128k"}),
     ("preset6", {"name":"fast_proxy_gen_fullres_avc_5m", "desc":"AVC NVENC(强制P7), tune ll, CBR 5M, full res, profile high"}),
@@ -612,19 +612,29 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     rc = opts.get("rc_mode","vbr"); br_min=opts.get("br_min"); br_max=opts.get("br_max"); cqp=opts.get("cqp")
     if "nvenc" in enc:
         # NVENC fixed policy:
-        # -c:v hevc_nvenc -preset p7 -tune hq -rc vbr -cq 22 -b:v 0
-        # -spatial_aq 1 -temporal_aq 1 -rc-lookahead 60 -bf 4 -b_ref_mode middle
+        # -c:v hevc_nvenc -preset p7 -tune uhq
+        # -rc vbr -cq 22 -b:v 0 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
+        # -rc-lookahead 64 -bf 4 -b_ref_mode middle -multipass fullres
+        # -g 240 -keyint_min 24 -weighted_pred 1
+        # -lookahead_level auto -surfaces 64
         cmd += [
             "-preset", "p7",
-            "-tune", "hq",
+            "-tune", "uhq",
             "-rc", "vbr",
             "-cq", "22",
             "-b:v", "0",
             "-spatial_aq", "1",
+            "-aq-strength", "12",
             "-temporal_aq", "1",
-            "-rc-lookahead", "60",
+            "-rc-lookahead", "64",
             "-bf", "4",
             "-b_ref_mode", "middle",
+            "-multipass", "fullres",
+            "-g", "240",
+            "-keyint_min", "24",
+            "-weighted_pred", "1",
+            "-lookahead_level", "auto",
+            "-surfaces", "64",
         ]
     elif "qsv" in enc:
         if rc=="vbr":
