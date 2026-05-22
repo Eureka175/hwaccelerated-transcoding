@@ -12,7 +12,7 @@ transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)
  - pre/post media info CSV，per-task log，实时进度输出。
 """
 
-import argparse, csv, json, shlex, subprocess, sys, threading, time
+import argparse, csv, json, shlex, shutil, subprocess, sys, threading, time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, OrderedDict
@@ -480,13 +480,13 @@ def _stream_copy_and_metadata_args(input_path: Path, output_path: Path):
 
 
 def _audio_codec_args_for_output(input_path: Path, output_path: Path):
-    """统一音频策略：全部转码为 AAC 320k。"""
-    return ["-c:a", "aac", "-b:a", "320k"]
+    """统一音频策略：音频流直拷贝。"""
+    return ["-c:a", "copy"]
 
 
 def _default_mux_audio_mode(input_path: Path, output_path: Path):
-    """默认混流音频模式：统一 AAC 320k。"""
-    return "aac320k"
+    """默认混流音频模式：音频流直拷贝。"""
+    return "copy"
 
 
 def _extra_stream_codec_args_for_output(output_path: Path):
@@ -566,15 +566,12 @@ def compare_audio_streams(src_path: Path, dst_path: Path):
 
 
 def verify_audio_presence_for_retry(src_path: Path, dst_path: Path):
-    """校验转码后音频流数量与 AAC 编码结果。"""
+    """校验转码后音频流数量。"""
     src_streams = _probe_audio_stream_brief(src_path)
     dst_streams = _probe_audio_stream_brief(dst_path)
     if len(src_streams) != len(dst_streams):
         return False, f"audio-stream-count-mismatch: src={len(src_streams)} dst={len(dst_streams)}"
-    for i, ds in enumerate(dst_streams):
-        if ds.get("codec") != "aac":
-            return False, f"aac-retry-codec-mismatch[{i}]: {ds.get('codec')}"
-    return True, "aac-retry-ok"
+    return True, "audio-stream-count-ok"
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_params: str=None):
     src_codec = _probe_video_codec_name(input_path)
@@ -673,7 +670,7 @@ def build_mux_cmd(video_only_path: Path, audio_source_path: Path, output_path: P
         "-c:d", "copy",
         "-c:t", "copy",
     ]
-    cmd += ["-c:a", "aac", "-b:a", "320k"]
+    cmd += ["-c:a", "copy"]
     cmd += [str(output_path)]
     return cmd
 
@@ -683,8 +680,8 @@ def build_audio_extract_cmd(src_path: Path, audio_only_path: Path):
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
         "-i", str(src_path),
         "-vn", "-sn", "-dn",
-        "-map", "0:a:0?",
-        "-c:a", "aac", "-b:a", "320k",
+        "-map", "0:a?",
+        "-c:a", "copy",
         str(audio_only_path),
     ]
 
@@ -958,6 +955,7 @@ def _execute_single_task(task, logs_root: Path, work_root: Path, timeout=None, s
 def execute_tasks(tasks, concurrency, work_root: Path, result_csv: Path, logs_root: Path, timeout=None, show_progress=True):
     STOP_EVENT.clear()
     total = len(tasks); lock = threading.Lock()
+    failed_tasks = []
     headers = ["src","dst","group","encoder","codec","preset","rc_mode","br_min","br_max","cqp","ffmpeg_cmd","log","returncode","note","secs"]
     if result_csv.exists(): result_csv.unlink()
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -978,13 +976,35 @@ def execute_tasks(tasks, concurrency, work_root: Path, result_csv: Path, logs_ro
                     append_csv(result_csv, headers, entry)
                     status = "OK" if rc==0 else f"ERR({rc})"
                     print(f"[{completed}/{total}] {Path(t['src']).name} -> {Path(t['dst']).name} : {status}  log:{logp.name}")
+                    if rc != 0:
+                        failed_tasks.append(dict(t))
         except KeyboardInterrupt:
             STOP_EVENT.set()
             _terminate_active_procs()
             ex.shutdown(wait=False, cancel_futures=True)
             print("Interrupted by user (Ctrl+C). All transcoding processes are being stopped.")
             raise SystemExit(130)
-    return
+    return failed_tasks
+
+
+def move_failed_sources_to_error(failed_tasks, src_root: Path, error_root: Path):
+    moved, skipped = [], []
+    for t in failed_tasks:
+        srcp = Path(t["src"])
+        if not srcp.exists():
+            skipped.append((str(srcp), "source-not-found"))
+            continue
+        try:
+            rel = srcp.relative_to(src_root)
+        except Exception:
+            rel = Path(srcp.name)
+        dstp = error_root.joinpath(rel)
+        dstp.parent.mkdir(parents=True, exist_ok=True)
+        if dstp.exists():
+            dstp = dstp.with_name(f"{dstp.stem}_failed{dstp.suffix}")
+        shutil.move(str(srcp), str(dstp))
+        moved.append((str(srcp), str(dstp)))
+    return moved, skipped
 
 # ---------------- main ----------------
 def main():
@@ -1381,7 +1401,7 @@ EXAMPLES:
             logs_dir = dst_root.parent.joinpath(f"{dst_root.name}_logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     # execute
-    execute_tasks(tasks, args.concurrency, work_root, result_csv, logs_dir, timeout=args.timeout, show_progress=True)
+    failed_tasks = execute_tasks(tasks, args.concurrency, work_root, result_csv, logs_dir, timeout=args.timeout, show_progress=True)
     # post media info
     out_entries = []
     for t in tasks:
@@ -1405,6 +1425,13 @@ EXAMPLES:
     print("Audio verify report written to:", audio_verify_csv)
     if not all_audio_ok:
         print("Warning: some output audio streams differ from source. See:", audio_verify_csv)
+    if failed_tasks:
+        src_root = src.parent if is_single_file else src
+        error_root = src_root.joinpath("error")
+        moved, skipped = move_failed_sources_to_error(failed_tasks, src_root, error_root)
+        print(f"Failed tasks: {len(failed_tasks)}. Moved to error folder: {len(moved)}. Error root: {error_root}")
+        if skipped:
+            print(f"Warning: {len(skipped)} failed source files were not moved (missing or unavailable).")
     print("Done. Results:", result_csv)
 
 if __name__ == "__main__":
