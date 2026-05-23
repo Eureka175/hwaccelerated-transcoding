@@ -645,7 +645,6 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             "-tune", "uhq",
             "-rc", "vbr",
             "-cq", "18",
-            "-b:v", "0",
             "-spatial_aq", "1",
             "-aq-strength", "12",
             "-temporal_aq", "1",
