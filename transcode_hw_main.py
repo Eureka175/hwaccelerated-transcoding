@@ -635,7 +635,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     if "nvenc" in enc:
         # NVENC fixed policy:
         # -c:v hevc_nvenc -profile:v rext -preset p7 -tune uhq
-        # -rc vbr -cq 18 -b:v 0 -spatial_aq 1 -aq-strength 15 -temporal_aq 1
+        # -rc vbr -cq 20 -b:v 0 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
         # -rc-lookahead 64 -lookahead_level auto
         # -bf 4 -b_ref_mode middle -multipass fullres
         # -g 240 -keyint_min 24
@@ -1063,7 +1063,7 @@ EXAMPLES:
   Directory with grouping and interactive per-group config:
     transcode_hw_main.py --src F:/Movies/Batch --dst F:/Out --work F:/Work --group
 
-  Skip interactive prompts but still show suggested params (skip bitrate and encoder prompt):
+  Skip interactive prompts and run with default params (skip bitrate and encoder prompt):
     transcode_hw_main.py --src F:/Movies/Batch --work F:/Work --skip --skip-bitrate --skip-encfmt
 """
     parser = argparse.ArgumentParser(description="transcode_hw_main: hw-accelerated batch transcode (nvenc/qsv/amf). Default: grouping ON. Use --no-group to treat all as 1 group.",
@@ -1092,7 +1092,7 @@ EXAMPLES:
     parser.add_argument("--query-params", choices=["nvenc","qsv","amf"], default=None, help="查询 ffmpeg encoder 参数并打印，支持单独运行（只需 --query-params 和 --work）。")
     parser.add_argument("--concurrency", type=int, default=1, help="并发 ffmpeg 进程数")
     parser.add_argument("--timeout", type=int, default=None, help="每任务超时（秒），默认无超时")
-    parser.add_argument("--skip", action="store_true", help="跳过交互（采用建议参数并直接执行）。默认不跳过。")
+    parser.add_argument("--skip", action="store_true", help="跳过交互（采用默认参数并直接执行）。默认不跳过。")
     parser.add_argument("--skip-bitrate", action="store_true", help="skip 时忽略码率交互/修改（接受建议）")
     parser.add_argument("--skip-res", action="store_true", help="skip 时忽略分辨率交互/修改")
     parser.add_argument("--skip-encfmt", action="store_true", help="skip 时忽略编码格式（hevc/h264）交互/修改")
@@ -1373,19 +1373,21 @@ EXAMPLES:
         # decide per-group configs
         group_configs = {}
         if args.skip:
-            # build suggested defaults and skip interactions according to skip flags
+            # build default configs for skip mode
             for g in groups:
                 rc_mode = "cqp"
                 cfg = {"encoder": args.encoder if not args.skip_hwaccel else args.encoder, "codec": args.codec,
                        "rc_mode": rc_mode, "preset": args.preset, "br_min": None, "br_max": None,
                        "cqp": 24,
                        "audio_bitrate":320, "scale":"same", "extra":""}
-                # skip specifics: if skip-bitrate then keep br_min/br_max as suggested; if skip-res skip scale edit (we already not interactive)
+                # skip mode uses fixed defaults without interactive edits.
                 group_configs[g["group_id"]] = cfg
             # print summary
-            print("Skip mode: will apply the following per-group configs (suggested):")
+            print("Skip mode: will apply the following per-group configs (defaults):")
             for k,v in group_configs.items():
-                print(f"  Group {k}: encoder={v['encoder']}, codec={v['codec']}, rc={v['rc_mode']}, cqp={v['cqp']}, preset={v['preset']}, scale={v['scale']}")
+                print(f"  Group {k}: encoder={v['encoder']}, codec={v['codec']}, cfg_rc={v['rc_mode']}, cfg_cqp={v['cqp']}, cfg_preset={v['preset']}, scale={v['scale']}")
+                if str(v["encoder"]).lower() == "nvenc":
+                    print("           effective NVENC: rc=vbr, cq=20, preset=p7, tune=uhq, aq=12, lookahead=64, multipass=fullres")
             if not args.skip_builtin_checks:
                 c = input("Confirm and proceed? (y/N): ").strip().lower()
                 if c != "y": print("Aborted"); sys.exit(0)
