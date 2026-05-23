@@ -505,7 +505,7 @@ def _extra_stream_codec_args_for_output(output_path: Path):
 def _probe_audio_stream_brief(path: Path):
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index,codec_name,channels,sample_rate,channel_layout,bit_rate",
+        "-show_entries", "stream=index,codec_name,channels,sample_rate,channel_layout,bit_rate,duration",
         "-of", "json", str(path)
     ]
     rc, out = run_cmd_capture(cmd)
@@ -524,6 +524,7 @@ def _probe_audio_stream_brief(path: Path):
             "sample_rate": str(st.get("sample_rate") or ""),
             "layout": str(st.get("channel_layout") or ""),
             "bit_rate": str(st.get("bit_rate") or ""),
+            "duration": str(st.get("duration") or ""),
         })
     return rows
 
@@ -544,6 +545,13 @@ def _audio_stream_hash(path: Path, stream_selector: str):
     return None
 
 
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 def compare_audio_streams(src_path: Path, dst_path: Path):
     src_streams = _probe_audio_stream_brief(src_path)
     dst_streams = _probe_audio_stream_brief(dst_path)
@@ -553,16 +561,30 @@ def compare_audio_streams(src_path: Path, dst_path: Path):
         return True, "no-audio-stream"
 
     for i, (ss, ds) in enumerate(zip(src_streams, dst_streams)):
-        for k in ["codec", "channels", "sample_rate", "layout"]:
+        for k in ["channels", "sample_rate"]:
             if str(ss.get(k)) != str(ds.get(k)):
                 return False, f"audio-meta-mismatch[{i}] {k}: src={ss.get(k)} dst={ds.get(k)}"
-        sh = _audio_stream_hash(src_path, f"0:a:{i}")
-        dh = _audio_stream_hash(dst_path, f"0:a:{i}")
-        if not sh or not dh:
-            return False, f"audio-hash-failed[{i}] src_hash={bool(sh)} dst_hash={bool(dh)}"
-        if sh != dh:
-            return False, f"audio-hash-mismatch[{i}]"
-    return True, "audio-identical"
+
+        src_layout = str(ss.get("layout") or "")
+        dst_layout = str(ds.get("layout") or "")
+        if src_layout and dst_layout and src_layout != dst_layout:
+            return False, f"audio-meta-mismatch[{i}] layout: src={src_layout} dst={dst_layout}"
+
+        src_dur = _safe_float(ss.get("duration"), 0.0)
+        dst_dur = _safe_float(ds.get("duration"), 0.0)
+        if src_dur > 0 and dst_dur > 0 and abs(src_dur - dst_dur) > 1.0:
+            return False, f"audio-duration-mismatch[{i}] src={src_dur:.3f}s dst={dst_dur:.3f}s"
+
+        # 仅当编码格式一致时做 bitstream hash；对于转码后的有损音频，hash 不可相同。
+        if str(ss.get("codec")) == str(ds.get("codec")):
+            sh = _audio_stream_hash(src_path, f"0:a:{i}")
+            dh = _audio_stream_hash(dst_path, f"0:a:{i}")
+            if not sh or not dh:
+                return False, f"audio-hash-failed[{i}] src_hash={bool(sh)} dst_hash={bool(dh)}"
+            if sh != dh:
+                return False, f"audio-hash-mismatch[{i}]"
+
+    return True, "audio-verify-ok"
 
 
 def verify_audio_presence_for_retry(src_path: Path, dst_path: Path):
