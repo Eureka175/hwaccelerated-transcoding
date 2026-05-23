@@ -635,7 +635,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     if "nvenc" in enc:
         # NVENC fixed policy:
         # -c:v hevc_nvenc -profile:v rext -preset p7 -tune uhq
-        # -rc vbr -cq 20 -b:v 0 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
+        # -rc vbr -cq 18 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
         # -rc-lookahead 64 -lookahead_level auto
         # -bf 4 -b_ref_mode middle -multipass fullres
         # -g 240 -keyint_min 24
@@ -644,8 +644,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             "-preset", "p7",
             "-tune", "uhq",
             "-rc", "vbr",
-            "-cq", "20",
-            "-b:v", "0",
+            "-cq", "18",
             "-spatial_aq", "1",
             "-aq-strength", "12",
             "-temporal_aq", "1",
