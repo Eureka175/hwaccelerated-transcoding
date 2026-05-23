@@ -635,7 +635,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     if "nvenc" in enc:
         # NVENC fixed policy:
         # -c:v hevc_nvenc -profile:v rext -preset p7 -tune uhq
-        # -rc vbr -cq 18 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
+        # -rc vbr -cq 18 -b:v 0 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
         # -rc-lookahead 64 -lookahead_level auto
         # -bf 4 -b_ref_mode middle -multipass fullres
         # -g 240 -keyint_min 24
@@ -1386,7 +1386,7 @@ EXAMPLES:
             for k,v in group_configs.items():
                 print(f"  Group {k}: encoder={v['encoder']}, codec={v['codec']}, cfg_rc={v['rc_mode']}, cfg_cqp={v['cqp']}, cfg_preset={v['preset']}, scale={v['scale']}")
                 if str(v["encoder"]).lower() == "nvenc":
-                    print("           effective NVENC: rc=vbr, cq=20, preset=p7, tune=uhq, aq=12, lookahead=64, multipass=fullres")
+                    print("           effective NVENC: rc=vbr, cq=18, preset=p7, tune=uhq, aq=12, lookahead=64, multipass=fullres")
             if not args.skip_builtin_checks:
                 c = input("Confirm and proceed? (y/N): ").strip().lower()
                 if c != "y": print("Aborted"); sys.exit(0)
