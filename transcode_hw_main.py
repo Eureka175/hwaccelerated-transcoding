@@ -505,7 +505,7 @@ def _extra_stream_codec_args_for_output(output_path: Path):
 def _probe_audio_stream_brief(path: Path):
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index,codec_name,channels,sample_rate,channel_layout,bit_rate",
+        "-show_entries", "stream=index,codec_name,channels,sample_rate,channel_layout,bit_rate,duration",
         "-of", "json", str(path)
     ]
     rc, out = run_cmd_capture(cmd)
@@ -524,6 +524,7 @@ def _probe_audio_stream_brief(path: Path):
             "sample_rate": str(st.get("sample_rate") or ""),
             "layout": str(st.get("channel_layout") or ""),
             "bit_rate": str(st.get("bit_rate") or ""),
+            "duration": str(st.get("duration") or ""),
         })
     return rows
 
@@ -544,6 +545,13 @@ def _audio_stream_hash(path: Path, stream_selector: str):
     return None
 
 
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 def compare_audio_streams(src_path: Path, dst_path: Path):
     src_streams = _probe_audio_stream_brief(src_path)
     dst_streams = _probe_audio_stream_brief(dst_path)
@@ -553,16 +561,30 @@ def compare_audio_streams(src_path: Path, dst_path: Path):
         return True, "no-audio-stream"
 
     for i, (ss, ds) in enumerate(zip(src_streams, dst_streams)):
-        for k in ["codec", "channels", "sample_rate", "layout"]:
+        for k in ["channels", "sample_rate"]:
             if str(ss.get(k)) != str(ds.get(k)):
                 return False, f"audio-meta-mismatch[{i}] {k}: src={ss.get(k)} dst={ds.get(k)}"
-        sh = _audio_stream_hash(src_path, f"0:a:{i}")
-        dh = _audio_stream_hash(dst_path, f"0:a:{i}")
-        if not sh or not dh:
-            return False, f"audio-hash-failed[{i}] src_hash={bool(sh)} dst_hash={bool(dh)}"
-        if sh != dh:
-            return False, f"audio-hash-mismatch[{i}]"
-    return True, "audio-identical"
+
+        src_layout = str(ss.get("layout") or "")
+        dst_layout = str(ds.get("layout") or "")
+        if src_layout and dst_layout and src_layout != dst_layout:
+            return False, f"audio-meta-mismatch[{i}] layout: src={src_layout} dst={dst_layout}"
+
+        src_dur = _safe_float(ss.get("duration"), 0.0)
+        dst_dur = _safe_float(ds.get("duration"), 0.0)
+        if src_dur > 0 and dst_dur > 0 and abs(src_dur - dst_dur) > 1.0:
+            return False, f"audio-duration-mismatch[{i}] src={src_dur:.3f}s dst={dst_dur:.3f}s"
+
+        # 仅当编码格式一致时做 bitstream hash；对于转码后的有损音频，hash 不可相同。
+        if str(ss.get("codec")) == str(ds.get("codec")):
+            sh = _audio_stream_hash(src_path, f"0:a:{i}")
+            dh = _audio_stream_hash(dst_path, f"0:a:{i}")
+            if not sh or not dh:
+                return False, f"audio-hash-failed[{i}] src_hash={bool(sh)} dst_hash={bool(dh)}"
+            if sh != dh:
+                return False, f"audio-hash-mismatch[{i}]"
+
+    return True, "audio-verify-ok"
 
 
 def verify_audio_presence_for_retry(src_path: Path, dst_path: Path):
@@ -613,7 +635,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     if "nvenc" in enc:
         # NVENC fixed policy:
         # -c:v hevc_nvenc -profile:v rext -preset p7 -tune uhq
-        # -rc vbr -cq 18 -b:v 0 -spatial_aq 1 -aq-strength 15 -temporal_aq 1
+        # -rc vbr -cq 20 -b:v 0 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
         # -rc-lookahead 64 -lookahead_level auto
         # -bf 4 -b_ref_mode middle -multipass fullres
         # -g 240 -keyint_min 24
@@ -622,10 +644,10 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             "-preset", "p7",
             "-tune", "uhq",
             "-rc", "vbr",
-            "-cq", "18",
+            "-cq", "20",
             "-b:v", "0",
             "-spatial_aq", "1",
-            "-aq-strength", "15",
+            "-aq-strength", "12",
             "-temporal_aq", "1",
             "-rc-lookahead", "64",
             "-lookahead_level", "auto",
@@ -1041,7 +1063,7 @@ EXAMPLES:
   Directory with grouping and interactive per-group config:
     transcode_hw_main.py --src F:/Movies/Batch --dst F:/Out --work F:/Work --group
 
-  Skip interactive prompts but still show suggested params (skip bitrate and encoder prompt):
+  Skip interactive prompts and run with default params (skip bitrate and encoder prompt):
     transcode_hw_main.py --src F:/Movies/Batch --work F:/Work --skip --skip-bitrate --skip-encfmt
 """
     parser = argparse.ArgumentParser(description="transcode_hw_main: hw-accelerated batch transcode (nvenc/qsv/amf). Default: grouping ON. Use --no-group to treat all as 1 group.",
@@ -1070,7 +1092,7 @@ EXAMPLES:
     parser.add_argument("--query-params", choices=["nvenc","qsv","amf"], default=None, help="查询 ffmpeg encoder 参数并打印，支持单独运行（只需 --query-params 和 --work）。")
     parser.add_argument("--concurrency", type=int, default=1, help="并发 ffmpeg 进程数")
     parser.add_argument("--timeout", type=int, default=None, help="每任务超时（秒），默认无超时")
-    parser.add_argument("--skip", action="store_true", help="跳过交互（采用建议参数并直接执行）。默认不跳过。")
+    parser.add_argument("--skip", action="store_true", help="跳过交互（采用默认参数并直接执行）。默认不跳过。")
     parser.add_argument("--skip-bitrate", action="store_true", help="skip 时忽略码率交互/修改（接受建议）")
     parser.add_argument("--skip-res", action="store_true", help="skip 时忽略分辨率交互/修改")
     parser.add_argument("--skip-encfmt", action="store_true", help="skip 时忽略编码格式（hevc/h264）交互/修改")
@@ -1351,19 +1373,21 @@ EXAMPLES:
         # decide per-group configs
         group_configs = {}
         if args.skip:
-            # build suggested defaults and skip interactions according to skip flags
+            # build default configs for skip mode
             for g in groups:
                 rc_mode = "cqp"
                 cfg = {"encoder": args.encoder if not args.skip_hwaccel else args.encoder, "codec": args.codec,
                        "rc_mode": rc_mode, "preset": args.preset, "br_min": None, "br_max": None,
                        "cqp": 24,
                        "audio_bitrate":320, "scale":"same", "extra":""}
-                # skip specifics: if skip-bitrate then keep br_min/br_max as suggested; if skip-res skip scale edit (we already not interactive)
+                # skip mode uses fixed defaults without interactive edits.
                 group_configs[g["group_id"]] = cfg
             # print summary
-            print("Skip mode: will apply the following per-group configs (suggested):")
+            print("Skip mode: will apply the following per-group configs (defaults):")
             for k,v in group_configs.items():
-                print(f"  Group {k}: encoder={v['encoder']}, codec={v['codec']}, rc={v['rc_mode']}, cqp={v['cqp']}, preset={v['preset']}, scale={v['scale']}")
+                print(f"  Group {k}: encoder={v['encoder']}, codec={v['codec']}, cfg_rc={v['rc_mode']}, cfg_cqp={v['cqp']}, cfg_preset={v['preset']}, scale={v['scale']}")
+                if str(v["encoder"]).lower() == "nvenc":
+                    print("           effective NVENC: rc=vbr, cq=20, preset=p7, tune=uhq, aq=12, lookahead=64, multipass=fullres")
             if not args.skip_builtin_checks:
                 c = input("Confirm and proceed? (y/N): ").strip().lower()
                 if c != "y": print("Aborted"); sys.exit(0)
