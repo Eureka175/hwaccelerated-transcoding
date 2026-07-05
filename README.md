@@ -126,7 +126,7 @@ python build.py
 ```
 
 `build.py` 会自动：
-1. 使用指定 Python 环境（默认 `C:\Users\吴汶睿\AppData\Local\Programs\Python\Python313`）
+1. 使用指定 Python 环境（默认 `C:\Users\wwr\AppData\Local\Programs\Python\Python313`）
 2. 查找系统中的 `ffmpeg.exe` / `ffprobe.exe`
 3. 安装 PyInstaller（若未安装）
 4. 打包为单文件 `transcode_hw_main.exe`
