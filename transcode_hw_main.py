@@ -11,7 +11,9 @@ transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)
  - pre/post media info CSV，per-task log，实时进度输出。
 """
 
-import argparse, csv, json, shlex, shutil, subprocess, sys, threading, time
+import argparse, csv, json, re, shlex, shutil, subprocess, sys, threading, time
+from dataclasses import dataclass
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
@@ -20,6 +22,54 @@ STOP_EVENT = threading.Event()
 ACTIVE_PROCS_LOCK = threading.Lock()
 ACTIVE_PROCS = set()
 _FFMPEG_FILTERS_CACHE = None
+MAX_FILES_PER_GROUP_DISPLAY = 5   # 每组终端最多显示文件数
+MAX_GROUPS_DISPLAY = 10           # 终端最多显示组数
+DEFAULT_SEGMENTS = [
+    ("dawn", dt_time(5, 0), dt_time(8, 0)),
+    ("morning", dt_time(8, 0), dt_time(12, 0)),
+    ("afternoon", dt_time(12, 0), dt_time(18, 0)),
+    ("evening", dt_time(18, 0), dt_time(22, 0)),
+    ("night", dt_time(22, 0), dt_time(5, 0)),  # 跨天
+]
+
+@dataclass
+class FileInfo:
+    path: Path
+    filename: str
+    creation_time_utc: str = ""
+    creation_time_local: str = ""
+
+@dataclass
+class Group:
+    prefix: str
+    files: list
+    time_range: str = ""
+
+# AMF note: 作者无 AMD 显卡进行实际验证，AMF 参数仅通过查阅 FFmpeg 文档及 AMD 官方资料整理，实际运行可能存在兼容性问题，欢迎 AMD 用户反馈。
+ENCODER_PARAM_TEMPLATES = {
+    "nvenc": ["-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "uhq", "-profile:v", "rext",
+              "-rc", "vbr", "-cq", "18", "-b:v", "0", "-spatial_aq", "1", "-aq-strength", "8",
+              "-temporal_aq", "1", "-rc-lookahead", "64", "-lookahead_level", "auto", "-bf", "4",
+              "-b_ref_mode", "middle", "-multipass", "fullres", "-g", "240", "-keyint_min", "24"],
+    "qsv": ["-c:v", "hevc_qsv", "-preset", "veryslow", "-profile:v", "rext", "-rc", "icq",
+            "-global_quality", "21", "-look_ahead", "1", "-look_ahead_depth", "100", "-adaptive_i", "1",
+            "-adaptive_b", "1", "-b_strategy", "1", "-bf", "5", "-refs", "5", "-rdo", "1",
+            "-mbbrc", "1", "-extbrc", "1", "-low_power", "0", "-async_depth", "7", "-g", "240", "-keyint_min", "24"],
+    "amf_10bit": ["-c:v", "hevc_amf", "-preset", "quality", "-profile:v", "rext", "-pix_fmt", "p010le",
+                  "-rc", "cqp", "-qp_i", "18", "-qp_p", "18", "-qp_b", "18", "-vbaq", "1",
+                  "-preanalysis", "1", "-pa_scene_change_detection", "1", "-bf", "3", "-max_num_reframes", "4",
+                  "-g", "240", "-keyint_min", "24"],
+    "amf_8bit": ["-c:v", "hevc_amf", "-preset", "quality", "-profile:v", "rext", "-pix_fmt", "yuv420p",
+                 "-rc", "hqvbr", "-qvbr_quality_level", "18", "-b:v", "0", "-vbaq", "1",
+                 "-preanalysis", "1", "-pa_scene_change_detection", "1", "-bf", "3", "-max_num_reframes", "4",
+                 "-g", "240", "-keyint_min", "24"],
+}
+
+PIX_FMT_CAPS = {
+    "yuv420p": (8, "4:2:0"), "nv12": (8, "4:2:0"), "p010le": (10, "4:2:0"),
+    "yuv420p10le": (10, "4:2:0"), "yuv422p": (8, "4:2:2"), "yuv422p10le": (10, "4:2:2"),
+    "yuv444p": (8, "4:4:4"), "yuv444p10le": (10, "4:4:4"),
+}
 
 DEFAULT_FORCED_QUALITY_POLICY = {
     "nvenc": {"preset": "p7"},
@@ -77,6 +127,98 @@ def probe_media(path: Path):
         return {"width": width, "height": height, "codec": codec, "fps": round(fps,3), "duration": duration, "bitrate": bitrate}
     except Exception:
         return None
+
+
+def parse_creation_time(probe_data, timezone_offset=8):
+    """从 ffprobe 数据提取 UTC creation_time，并按 --timezone 转换为本地时间。"""
+    raw = (((probe_data or {}).get("format") or {}).get("tags") or {}).get("creation_time", "")
+    if not raw:
+        return "", ""
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        dt_utc = datetime.fromisoformat(normalized).replace(tzinfo=None)
+        dt_local = dt_utc + timedelta(hours=timezone_offset)
+        return dt_utc.isoformat(), dt_local.isoformat()
+    except Exception:
+        return "", ""
+
+
+def _ffprobe_video_and_format(path: Path):
+    """一次 ffprobe 同时读取主视频像素格式与 format tags，减少重复探测。"""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+           "stream=pix_fmt,bits_per_raw_sample:format_tags=creation_time", "-of", "json", str(path)]
+    rc, out = run_cmd_capture(cmd)
+    if rc != 0 or not out:
+        return {}
+    try:
+        return json.loads(out) or {}
+    except Exception:
+        return {}
+
+
+def probe_input_format(path: Path, timezone_offset=8):
+    """探测输入位深、色度采样与 creation_time，并返回 CSV 友好的记录。"""
+    probe_data = _ffprobe_video_and_format(path)
+    st = (probe_data.get("streams") or [{}])[0] if probe_data else {}
+    pix_fmt = str(st.get("pix_fmt") or "")
+    raw_bits = str(st.get("bits_per_raw_sample") or "")
+    bit_depth, chroma = PIX_FMT_CAPS.get(pix_fmt, (None, "unknown"))
+    if not bit_depth:
+        if raw_bits.isdigit(): bit_depth = int(raw_bits)
+        elif "10" in pix_fmt or "p010" in pix_fmt: bit_depth = 10
+        elif pix_fmt: bit_depth = 8
+    creation_utc, creation_local = parse_creation_time(probe_data, timezone_offset=timezone_offset)
+    return {"file_path": str(path), "bit_depth": f"{bit_depth}bit" if bit_depth else "unknown",
+            "chroma_subsampling": chroma, "creation_time_utc": creation_utc,
+            "creation_time_local": creation_local, "timezone_offset": f"UTC{timezone_offset:+d}",
+            "pixel_format": pix_fmt, "probe_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def probe_encoder_capabilities():
+    rc, encoders = run_cmd_capture(["ffmpeg", "-hide_banner", "-encoders"])
+    rows = []
+    for enc in ["hevc_nvenc", "hevc_qsv", "hevc_amf"]:
+        available = int(rc == 0 and enc in encoders)
+        profiles, pix_fmts = [], []
+        if available:
+            _, help_text = run_cmd_capture(["ffmpeg", "-hide_banner", "-h", f"encoder={enc}"])
+            for line in help_text.splitlines():
+                low = line.lower()
+                if "supported pixel formats:" in low:
+                    pix_fmts = line.split(":", 1)[1].strip().split()
+                elif "profile" in low and any(x in low for x in ["main", "rext", "main10"]):
+                    parts = line.strip().split()
+                    if parts: profiles.append(parts[0])
+        rows.append({"encoder_name": enc, "available": available,
+                     "supported_profiles": ";".join(sorted(set(profiles))),
+                     "supported_pixel_formats": ";".join(pix_fmts),
+                     "probe_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    return rows
+
+def _cap_supports(cap_row, bit_depth, chroma):
+    fmts = str(cap_row.get("supported_pixel_formats") or "").split(";")
+    for fmt in fmts:
+        bd, cs = PIX_FMT_CAPS.get(fmt, (None, None))
+        if bd == bit_depth and cs == chroma:
+            return True
+    return not fmts
+
+def _format_bit_depth(s):
+    try: return int(str(s).replace("bit", ""))
+    except Exception: return None
+
+def _print_task_commands(tasks):
+    print("\nFFmpeg commands to be executed:")
+    for i, t in enumerate(tasks, 1):
+        print(f"[{i}/{len(tasks)}] {t['src']} -> {t['dst']}")
+        print("  " + " ".join(shlex.quote(x) for x in t["ffmpeg_cmd"]))
+        if t.get("actual_output_format"):
+            print(f"  output-format: {t['actual_output_format']}")
+
+def _summarize_params(tasks):
+    print("\nActual parameter summary:")
+    for t in tasks:
+        print(f"- {Path(t['dst']).name}: encoder={t.get('encoder')} codec={t.get('codec')} output_format={t.get('actual_output_format','default/auto')}")
 
 def _parse_fps(s):
     if not s: return 0.0
@@ -207,6 +349,212 @@ def group_by_res_fps(files):
         group_list.append({"group_id":idx,"width":w,"height":h,"fps":fps,"files":groups[k]})
     return entries, group_list
 
+
+def _parse_local_dt(value: str):
+    """把 CSV 中的 local creation_time 转回 datetime；失败返回 None。"""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _file_infos_from_probe_rows(files, input_probe_map):
+    """把 Path 列表与探测表合成为分组系统使用的 FileInfo。"""
+    infos = []
+    for f in files:
+        row = input_probe_map.get(str(Path(f)), {})
+        infos.append(FileInfo(
+            path=Path(f),
+            filename=Path(f).name,
+            creation_time_utc=row.get("creation_time_utc", ""),
+            creation_time_local=row.get("creation_time_local", ""),
+        ))
+    return infos
+
+
+def _groups_to_legacy_dicts(groups):
+    """把新 Group 对象转换为既有任务构建流程可消费的 dict 结构。"""
+    out = []
+    for idx, g in enumerate(groups):
+        out.append({"group_id": idx, "prefix": g.prefix, "time_range": g.time_range,
+                    "files": [{"path": str(fi.path)} for fi in g.files]})
+    return out
+
+
+def _parse_interval_hours(value: str):
+    """解析 --grp-by-time 的 2h/4h/6h 格式。"""
+    m = re.fullmatch(r"(\d{1,2})h", str(value or "").strip().lower())
+    if not m:
+        raise ValueError("--grp-by-time must look like 2h, 4h, or 6h")
+    hours = int(m.group(1))
+    if hours <= 0 or hours > 24:
+        raise ValueError("--grp-by-time hours must be between 1 and 24")
+    return hours
+
+
+def group_by_time_interval(files, interval_hours):
+    """按固定小时间隔分组；无 creation_time 的文件进入 ungrouped。"""
+    groups = {}
+    ungrouped = []
+    for f in files:
+        dt = _parse_local_dt(f.creation_time_local)
+        if not dt:
+            ungrouped.append(f); continue
+        date_str = dt.strftime("%Y%m%d")
+        start_hour = (dt.hour // interval_hours) * interval_hours
+        end_hour = start_hour + interval_hours
+        start_str = f"{start_hour:02d}00"
+        end_str = f"{end_hour:02d}00"
+        prefix = f"{date_str}_{start_str}-{end_str}"
+        groups.setdefault(prefix, []).append(f)
+    result = [Group(prefix=p, files=fs, time_range=p.split("_", 1)[-1]) for p, fs in sorted(groups.items())]
+    if ungrouped:
+        result.append(Group(prefix="ungrouped", files=ungrouped, time_range="unknown"))
+    return result
+
+
+def parse_time_segments(segment_str):
+    """解析 --time-segments，返回 (label,start,end) 列表；为空时使用默认分段。"""
+    if not segment_str:
+        return DEFAULT_SEGMENTS
+    segments = []
+    for part in segment_str.split(","):
+        time_range, label = part.strip().split("=", 1)
+        start_str, end_str = time_range.split("-", 1)
+        start = datetime.strptime(start_str.strip(), "%H:%M").time()
+        end = datetime.strptime(end_str.strip(), "%H:%M").time()
+        segments.append((label.strip(), start, end))
+    return segments
+
+
+def match_time_segment(dt, segments):
+    """匹配自定义时段，支持 22:00-05:00 这类跨天区间。"""
+    t = dt.time()
+    for label, start, end in segments:
+        if start < end:
+            if start <= t < end:
+                return label
+        else:
+            if t >= start or t < end:
+                return label
+    return None
+
+
+def group_by_time_segments(files, segments):
+    """按命名时间段分组，前缀为 YYYYMMDD_label。"""
+    groups = {}
+    ungrouped = []
+    label_ranges = {label: f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')}" for label, start, end in segments}
+    for f in files:
+        dt = _parse_local_dt(f.creation_time_local)
+        if not dt:
+            ungrouped.append(f); continue
+        label = match_time_segment(dt, segments)
+        if not label:
+            ungrouped.append(f); continue
+        prefix = f"{dt.strftime('%Y%m%d')}_{label}"
+        groups.setdefault(prefix, []).append(f)
+    result = []
+    for p, fs in sorted(groups.items()):
+        label = p.split("_", 1)[-1]
+        result.append(Group(prefix=p, files=fs, time_range=label_ranges.get(label, "")))
+    if ungrouped:
+        result.append(Group(prefix="ungrouped", files=ungrouped, time_range="unknown"))
+    return result
+
+
+def group_by_regex(files, pattern):
+    """按正则第一个捕获组分组；未匹配文件进入 ungrouped。"""
+    regex = re.compile(pattern)
+    groups = {}
+    ungrouped = []
+    for f in files:
+        m = regex.match(f.filename)
+        if m:
+            prefix = m.group(1)
+            groups.setdefault(prefix, []).append(f)
+        else:
+            ungrouped.append(f)
+    result = [Group(prefix=p, files=fs) for p, fs in sorted(groups.items())]
+    if ungrouped:
+        result.append(Group(prefix="ungrouped", files=ungrouped))
+    return result
+
+
+def group_by_filename_prefix(files, prefix_len):
+    """按文件名前 N 个字符分组，用作 --grp-prefix 的简单策略。"""
+    groups = {}
+    n = int(prefix_len)
+    for f in files:
+        groups.setdefault(f.filename[:n], []).append(f)
+    return [Group(prefix=p, files=fs) for p, fs in sorted(groups.items())]
+
+
+def resolve_grouping_strategy(args):
+    """分组参数优先级：regex > time_segments > grp_by_time > grp_prefix。"""
+    if args.grp_regex:
+        return "regex"
+    if args.time_segments:
+        return "time_segments"
+    if args.grp_by_time:
+        return "time_interval"
+    if args.grp_prefix:
+        return "prefix"
+    return None
+
+
+def _write_group_detail_txt(groups, txt_path: Path, timezone_offset):
+    """写出完整分组 TXT 明细，避免终端输出过长。"""
+    txt_path.parent.mkdir(parents=True, exist_ok=True)
+    total_files = sum(len(g.files) for g in groups)
+    lines = ["分组详情", f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+             f"时区: UTC{timezone_offset:+d}", f"总计: {len(groups)} 组, {total_files} 文件", ""]
+    for gi, g in enumerate(groups, 1):
+        lines += [f"[组 {gi}/{len(groups)}] 前缀: {g.prefix}", f"时段: {g.time_range or '-'}", f"文件数: {len(g.files)}", "文件列表:"]
+        for fi, f in enumerate(g.files, 1):
+            utc = f.creation_time_utc or "unknown"
+            local = f.creation_time_local or "unknown"
+            lines.append(f"  {fi}. {f.path} | UTC: {utc} → LOCAL: {local}")
+        lines.append("")
+    txt_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_group_detail_csv(groups, csv_path: Path):
+    """写出完整分组 CSV 明细，供后续审计或表格处理。"""
+    rows = []
+    for gi, g in enumerate(groups, 1):
+        for fi, f in enumerate(g.files, 1):
+            rows.append({"group_index": gi, "group_prefix": g.prefix, "time_range": g.time_range,
+                         "file_index": fi, "file_path": str(f.path),
+                         "creation_time_utc": f.creation_time_utc, "creation_time_local": f.creation_time_local})
+    write_csv(csv_path, ["group_index","group_prefix","time_range","file_index","file_path","creation_time_utc","creation_time_local"], rows)
+
+
+def print_group_summary(groups, timezone_offset, output_dir=None):
+    """终端仅打印有限分组/文件，完整分组写出到 TXT/CSV。"""
+    total_groups = len(groups)
+    total_files = sum(len(g.files) for g in groups)
+    print(f"[分组结果] 时区: UTC{timezone_offset:+d} | 共 {total_groups} 组, {total_files} 个文件")
+    for g in groups[:MAX_GROUPS_DISPLAY]:
+        files_display = g.files[:MAX_FILES_PER_GROUP_DISPLAY]
+        files_str = ", ".join([f.filename for f in files_display])
+        omitted = len(g.files) - len(files_display)
+        if omitted > 0:
+            files_str += f" ... 等 {omitted} 个文件"
+        print(f"  [{g.prefix}] {len(g.files)} 文件 | {files_str}")
+    if total_groups > MAX_GROUPS_DISPLAY:
+        print(f"  ... 等 {total_groups - MAX_GROUPS_DISPLAY} 组未显示")
+    if output_dir:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        txt_path = Path(output_dir) / f"group_detail_{timestamp}.txt"
+        csv_path = Path(output_dir) / f"group_detail_{timestamp}.csv"
+        _write_group_detail_txt(groups, txt_path, timezone_offset)
+        _write_group_detail_csv(groups, csv_path)
+        print(f"详细分组列表: {txt_path}")
+        print(f"详细分组 CSV: {csv_path}")
+
 # ---------------- ffmpeg cmd builder ----------------
 def _resolve_video_encoder(encoder: str, codec: str):
     if encoder == "nvenc":
@@ -280,11 +628,7 @@ def _resolve_hw_decode_args(encoder: str, src_codec: str):
             "vp9": "vp9_cuvid",
             "av1": "av1_cuvid",
         }
-        args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        dec = nvdec_map.get(src_codec)
-        if dec:
-            args += ["-c:v", dec]
-        return args
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
     if encoder == "qsv":
         qsv_map = {
             "h264": "h264_qsv",
@@ -295,14 +639,9 @@ def _resolve_hw_decode_args(encoder: str, src_codec: str):
             "vp9": "vp9_qsv",
             "av1": "av1_qsv",
         }
-        args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
-        dec = qsv_map.get(src_codec)
-        if dec:
-            args += ["-c:v", dec]
-        return args
+        return ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
     if encoder == "amf":
-        # FFmpeg 没有通用的 *_amf 解码器，AMD 通常走 D3D11VA 硬解路径
-        return ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+        return []
     return []
 
 
@@ -382,6 +721,50 @@ def _strip_conflicting_quality_tokens(tokens, encoder: str, manual_override=Fals
         i += 1
     return out
 
+
+
+def _merge_args(base_cmd, override_args):
+    """合并命令参数；override_args 中同名 -key 覆盖 base_cmd，保留输出路径位置。"""
+    if not override_args:
+        return base_cmd
+    override_map = {}
+    i = 0
+    while i < len(override_args):
+        key = override_args[i]
+        if key.startswith("-"):
+            if i + 1 < len(override_args) and not override_args[i + 1].startswith("-"):
+                override_map[key] = override_args[i + 1]
+                i += 2
+            else:
+                override_map[key] = None
+                i += 1
+        else:
+            i += 1
+    seen = set()
+    new_cmd = []
+    i = 0
+    while i < len(base_cmd):
+        key = base_cmd[i]
+        if key in override_map:
+            new_cmd.append(key)
+            if override_map[key] is not None:
+                new_cmd.append(override_map[key])
+            seen.add(key)
+            i += 1
+            if i < len(base_cmd) and not base_cmd[i].startswith("-"):
+                i += 1
+            continue
+        new_cmd.append(key)
+        i += 1
+    insert_at = len(new_cmd) - 1 if new_cmd else 0
+    additions = []
+    for key, val in override_map.items():
+        if key in seen:
+            continue
+        additions.append(key)
+        if val is not None:
+            additions.append(val)
+    return new_cmd[:insert_at] + additions + new_cmd[insert_at:]
 
 def _forced_quality_args(encoder: str, manual_override=False):
     if manual_override:
@@ -551,7 +934,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     elif _scale_requested(opts.get("scale")):
         need_sw_decode_for_scale = not bool(hw_scale_vf)
 
-    decode_args = [] if need_sw_decode_for_scale else _resolve_hw_decode_args(opts.get("encoder"), src_codec)
+    decode_args = [] if (need_sw_decode_for_scale or opts.get("force_cpu_decode")) else _resolve_hw_decode_args(opts.get("encoder"), src_codec)
     base = ["ffmpeg","-y","-hide_banner","-loglevel","info", *decode_args, "-i", str(input_path)]
     copy_meta_args = _stream_copy_and_metadata_args(input_path, output_path)
     if custom_params:
@@ -571,54 +954,21 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             pass
         else:
             cmd += ["-vf", f"scale={scale}"]
-    # video encoder
+    # video encoder: validated HEVC templates are centralized in ENCODER_PARAM_TEMPLATES.
     codec = opts.get("codec","hevc")
-    enc = _resolve_video_encoder(opts.get("encoder"), codec)
-    cmd += ["-c:v", enc]
-    if opts.get("preset"): cmd += ["-preset", str(opts.get("preset"))]
-    # rc
-    rc = opts.get("rc_mode","vbr"); br_min=opts.get("br_min"); br_max=opts.get("br_max"); cqp=opts.get("cqp")
-    if "nvenc" in enc:
-        # NVENC fixed policy:
-        # -c:v hevc_nvenc -profile:v rext -preset p7 -tune uhq
-        # -rc vbr -cq 18 -b:v 0 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
-        # -rc-lookahead 64 -lookahead_level auto
-        # -bf 4 -b_ref_mode middle -multipass fullres
-        # -g 240 -keyint_min 24
-        cmd += [
-            "-profile:v", "rext",
-            "-preset", "p7",
-            "-tune", "uhq",
-            "-rc", "vbr",
-            "-cq", "18",
-            "-spatial_aq", "1",
-            "-aq-strength", "12",
-            "-temporal_aq", "1",
-            "-rc-lookahead", "64",
-            "-lookahead_level", "auto",
-            "-bf", "4",
-            "-b_ref_mode", "middle",
-            "-multipass", "fullres",
-            "-g", "240",
-            "-keyint_min", "24",
-        ]
-    elif "qsv" in enc:
-        if rc=="vbr":
-            if br_min: cmd += ["-rc","vbr","-b:v", human_bitrate(br_min)]
-            if br_max: cmd += ["-maxrate", human_bitrate(br_max), "-bufsize", human_bitrate(br_max*2)]
-        elif rc=="cqp" and cqp is not None:
-            cmd += ["-rc","constqp","-qp", str(cqp)]
-        elif rc=="icq" and cqp is not None:
-            cmd += ["-global_quality", str(cqp)]
-    elif "amf" in enc:
-        if rc=="vbr":
-            if br_min: cmd += ["-rc","vbr","-b:v", human_bitrate(br_min)]
-            if br_max: cmd += ["-maxrate", human_bitrate(br_max), "-bufsize", human_bitrate(br_max*2)]
-        elif rc=="cqp" and cqp is not None:
-            cmd += ["-rc","constqp","-qp", str(cqp)]
+    enc_backend = opts.get("encoder")
+    enc = _resolve_video_encoder(enc_backend, codec)
+    if codec == "hevc" and enc_backend == "nvenc":
+        cmd += ENCODER_PARAM_TEMPLATES["nvenc"]
+    elif codec == "hevc" and enc_backend == "qsv":
+        cmd += ENCODER_PARAM_TEMPLATES["qsv"]
+    elif codec == "hevc" and enc_backend == "amf":
+        in_depth = opts.get("input_bit_depth")
+        cmd += ENCODER_PARAM_TEMPLATES["amf_10bit" if in_depth == 10 else "amf_8bit"]
     else:
+        cmd += ["-c:v", enc]
+        rc = opts.get("rc_mode","vbr"); br_min=opts.get("br_min"); br_max=opts.get("br_max"); cqp=opts.get("cqp")
         if rc=="cqp" and cqp is not None:
-            # software encoders prefer CRF semantics over fixed QP for practical VOD use
             cmd += ["-crf", str(cqp)]
             if br_max:
                 cmd += ["-maxrate", human_bitrate(br_max), "-bufsize", human_bitrate(br_max*2)]
@@ -631,8 +981,16 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             opts.get("encoder"),
             manual_override=manual_quality_override,
         )
-    cmd += _forced_quality_args(opts.get("encoder"), manual_override=manual_quality_override)
     cmd += [str(output_path)]
+    # FIX: quality override merge for HEVC templates (--nvenc-qual/--qsv-qual/--amf-qual).
+    quality_args = _forced_quality_args(opts.get("encoder"), manual_override=False)
+    if quality_args:
+        cmd = _merge_args(cmd, quality_args)
+    # FIX: fallback_pix_fmt for audio rebuild；所有 build_ffmpeg_cmd 调用都会在输出文件前插入 fallback 像素格式。
+    fallback_pix_fmt = opts.get("fallback_pix_fmt")
+    if fallback_pix_fmt and "-pix_fmt" not in cmd:
+        output_idx = len(cmd) - 1
+        cmd = cmd[:output_idx] + ["-pix_fmt", fallback_pix_fmt] + cmd[output_idx:]
     return cmd
 
 
@@ -1001,19 +1359,25 @@ EXAMPLES:
   Directory transcode with explicit output folder:
     transcode_hw_main.py --src F:/Movies/Batch --dst F:/Out --skip
 
-  Directory with grouping and interactive per-group config:
+  Directory with legacy resolution/FPS grouping and interactive per-group config:
     transcode_hw_main.py --src F:/Movies/Batch --dst F:/Out --work F:/Work --group
 
   Skip interactive prompts and run with default params (skip bitrate and encoder prompt):
     transcode_hw_main.py --src F:/Movies/Batch --work F:/Work --skip --skip-bitrate --skip-encfmt
 """
-    parser = argparse.ArgumentParser(description="transcode_hw_main: hw-accelerated batch transcode (nvenc/qsv/amf). Default: grouping ON. Use --no-group to treat all as 1 group.",
+    parser = argparse.ArgumentParser(description="transcode_hw_main: hw-accelerated batch transcode (nvenc/qsv/amf). 默认不分组；使用 --group 保留旧的分辨率/FPS 分组，或使用 --grp-regex/--grp-by-time/--time-segments。",
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog=examples)
     parser.add_argument("--src", help="源路径（文件或目录）。可为单个文件或目录。若省略且只执行 --query-params，则可不指定。")
     parser.add_argument("--dst", help="目标根目录。未指定时默认输出到源路径同级的 <src>_comp 目录；单文件输出到该目录中。")
     parser.add_argument("--work", help="工作目录（CSV, logs, mediainfo 等）。若只想 query encoder，也可用 --work 指定保存位置。")
     parser.add_argument("--recursive", action="store_true", help="递归遍历子文件夹（默认不递归）")
+    parser.add_argument("--timezone", type=int, default=8, choices=range(-12, 15), metavar="[-12..14]", help="creation_time 本地转换时区偏移，默认 +8（BJT）。")
+    parser.add_argument("--grp-by-time", default="", help="按固定时间间隔分组，例如 2h/4h/6h；前缀格式 YYYYMMDD_HHMM-HHMM。")
+    parser.add_argument("--time-segments", default="", help="按自定义时段分组，例如 05:00-08:00=dawn,08:00-12:00=morning；支持跨天。")
+    parser.add_argument("--grp-regex", default="", help="按文件名正则第一个捕获组分组，例如 ^(\\d{8})。优先级最高。")
+    parser.add_argument("--grp-prefix", type=int, default=None, help="按文件名前 N 个字符分组；优先级低于 regex/time 分组。")
+    parser.add_argument("--output-dir", default=None, help="分组输出根目录；等价于 --dst，支持在路径中使用 {prefix} 模板变量。")
     parser.add_argument("--extensions", default="mp4,mov", help="要处理的文件扩展名，逗号分隔（例如 mp4,mov）")
     parser.add_argument("--prefixes", default="", help="文件名前缀白名单，逗号分隔（例如 DJI）。不指定则不过滤前缀。")
     parser.add_argument("--suffixes", default="", help="文件名后缀白名单，逗号分隔（例如 _EDIT）。不指定则不过滤后缀。")
@@ -1032,12 +1396,12 @@ EXAMPLES:
     parser.add_argument("--query-params", choices=["nvenc","qsv","amf"], default=None, help="查询 ffmpeg encoder 参数并打印，支持单独运行（只需 --query-params 和 --work）。")
     parser.add_argument("--concurrency", type=int, default=1, help="并发 ffmpeg 进程数")
     parser.add_argument("--timeout", type=int, default=None, help="每任务超时（秒），默认无超时")
-    parser.add_argument("--skip", action="store_true", help="跳过交互（采用默认参数并直接执行）。默认不跳过。")
+    parser.add_argument("--skip", action="store_true", help="完全跳过所有交互确认（采用默认参数并直接执行）。默认不跳过。")
     parser.add_argument("--skip-bitrate", action="store_true", help="skip 时忽略码率交互/修改（接受建议）")
     parser.add_argument("--skip-res", action="store_true", help="skip 时忽略分辨率交互/修改")
     parser.add_argument("--skip-encfmt", action="store_true", help="skip 时忽略编码格式（hevc/h264）交互/修改")
     parser.add_argument("--skip-hwaccel", action="store_true", help="skip 时忽略硬件加速器选择（nvenc/qsv/amf）交互/修改")
-    parser.add_argument("--skip-builtin-checks", action="store_true", help="跳过部分内建检查（用于非交互/CI）")
+    parser.add_argument("--skip-builtin-checks", "--skip-check", action="store_true", help="跳过执行前确认与严格输出兼容性终止；仍打印参数，并启用输出格式降级 fallback。")
     parser.add_argument("--show-groups-only", action="store_true", help="仅显示分组与 preflight CSV，然后退出")
     parser.add_argument("--flat-output", action="store_true", help="所有输出放在同一目标目录（不保留原始目录结构）；若冲突自动在文件名加源目录名后缀")
     parser.add_argument("--out-suffix", default="", help="输出文件名后缀（例如 _comp 或 deliver；未以下划线开头时会自动补 _）。")
@@ -1096,6 +1460,8 @@ EXAMPLES:
     audio_verify_csv = work_root.joinpath("audio_verify.csv")
     tasks_json = work_root.joinpath("tasks_preflight.json")
     result_csv = work_root.joinpath("tasks_result.csv")
+    input_probe_csv = work_root.joinpath("input_probe.csv")
+    encoder_caps_csv = work_root.joinpath("encoder_capabilities.csv")
 
     # if query requested plus src/work provided, do query as well
     if args.query_params:
@@ -1105,8 +1471,10 @@ EXAMPLES:
     # detect single-file vs dir
     is_single_file = src.is_file()
     # default dst handling: write outputs to a sibling <src>_comp folder when --dst is omitted.
+    if args.output_dir and not args.dst:
+        args.dst = args.output_dir
     if args.dst:
-        dst_root = Path(args.dst).expanduser().resolve()
+        dst_root = Path(args.dst.replace("{prefix}", "__group__")).expanduser().resolve() if "{prefix}" in args.dst else Path(args.dst).expanduser().resolve()
     else:
         print("Note: --dst not provided. Defaulting to sibling output folder: <src>_comp.")
         dst_root = src.parent.joinpath(f"{src.name}_comp")
@@ -1119,6 +1487,10 @@ EXAMPLES:
 
     def make_task(srcp: Path, outp: Path, group_id, opts: dict, custom_params=None, encoder_label=None, ffmpeg_cmds=None, src_duration_sec=None):
         opts_local = dict(opts or {})
+        probe_row = input_probe_map.get(str(srcp), {})
+        opts_local["input_bit_depth"] = _format_bit_depth(probe_row.get("bit_depth"))
+        opts_local["input_chroma_subsampling"] = probe_row.get("chroma_subsampling")
+        actual_output_format = "default/auto"
         enc_name = str(opts_local.get("encoder", "")).lower()
         manual_quality_override = (
             (enc_name == "nvenc" and args.nvenc_qual is not None) or
@@ -1127,7 +1499,22 @@ EXAMPLES:
         )
         if manual_quality_override:
             opts_local["manual_quality_override"] = True
+        if not custom_params and enc_name in {"nvenc", "qsv", "amf"}:
+            cap = encoder_cap_map.get(_resolve_video_encoder(enc_name, opts_local.get("codec", "hevc")), {})
+            bd = opts_local.get("input_bit_depth")
+            chroma = opts_local.get("input_chroma_subsampling")
+            if cap and not _cap_supports(cap, bd, chroma):
+                print(f"WARNING: input {bd}bit {chroma} may not be supported by hardware decode/encode capability table; removing -hwaccel and using CPU software decode for {srcp}")
+                opts_local["force_cpu_decode"] = True
+            if args.skip_builtin_checks and bd == 10:
+                opts_local["fallback_pix_fmt"] = "p010le"
+                actual_output_format = "10bit 4:2:0 (p010le fallback candidate)"
+            elif args.skip_builtin_checks:
+                opts_local["fallback_pix_fmt"] = "yuv420p"
+                actual_output_format = "8bit 4:2:0 (yuv420p fallback candidate)"
         cmd = build_ffmpeg_cmd(srcp, outp, opts_local, custom_params=custom_params)
+        if opts_local.get("fallback_pix_fmt"):
+            print(f"WARNING: --skip-check enabled; output fallback format for {srcp} -> {opts_local['fallback_pix_fmt']}")
         task = {
             "src": str(srcp),
             "dst": str(outp),
@@ -1143,6 +1530,7 @@ EXAMPLES:
             "custom_params": custom_params,
             "ffmpeg_cmd": cmd,
             "src_duration_sec": src_duration_sec,
+            "actual_output_format": actual_output_format,
         }
         if ffmpeg_cmds:
             task["ffmpeg_cmds"] = ffmpeg_cmds
@@ -1152,6 +1540,13 @@ EXAMPLES:
         if force_mov_map.get(str(srcp), False):
             return outp.with_suffix(".mov")
         return outp
+
+    def _apply_group_output_template(outp: Path, group_prefix):
+        # 中文注释：--output-dir/--dst 支持 {prefix}，用于把不同分组输出到独立目录。
+        template = args.dst or ""
+        if "{prefix}" not in template:
+            return outp
+        return Path(str(outp).replace("__group__", str(group_prefix or "ungrouped")))
 
     # collect files
     files = []
@@ -1163,21 +1558,50 @@ EXAMPLES:
         print("No files found. Exiting."); sys.exit(0)
     print(f"Found {len(files)} input files. Probing media info...")
     entries, groups = group_by_res_fps(files)
+    input_probe_rows = [probe_input_format(Path(f), timezone_offset=args.timezone) for f in files]
+    input_probe_map = {r["file_path"]: r for r in input_probe_rows}
+    encoder_cap_rows = probe_encoder_capabilities()
+    encoder_cap_map = {r["encoder_name"]: r for r in encoder_cap_rows}
+    write_csv(input_probe_csv, ["file_path","bit_depth","chroma_subsampling","creation_time_utc","creation_time_local","timezone_offset","pixel_format","probe_time"], input_probe_rows)
+    write_csv(encoder_caps_csv, ["encoder_name","available","supported_profiles","supported_pixel_formats","probe_time"], encoder_cap_rows)
     src_duration_map = {str(e.get("path")): _safe_float(e.get("duration")) for e in entries}
     force_mov_map = {str(Path(e.get("path"))): _should_force_mov_output(Path(e.get("path"))) for e in entries}
-    write_csv(preflight_csv, ["path","width","height","fps","codec","duration","bitrate"], entries)
+    write_csv(preflight_csv, ["path","width","height","fps","codec","duration","bitrate","bit_depth","chroma_subsampling","creation_time_utc","creation_time_local","timezone_offset","probe_time"], [{**e, **{"bit_depth": input_probe_map.get(str(Path(e["path"])),{}).get("bit_depth",""), "chroma_subsampling": input_probe_map.get(str(Path(e["path"])),{}).get("chroma_subsampling",""), "creation_time_utc": input_probe_map.get(str(Path(e["path"])),{}).get("creation_time_utc",""), "creation_time_local": input_probe_map.get(str(Path(e["path"])),{}).get("creation_time_local",""), "timezone_offset": input_probe_map.get(str(Path(e["path"])),{}).get("timezone_offset",""), "probe_time": input_probe_map.get(str(Path(e["path"])),{}).get("probe_time","")}} for e in entries])
+    # 中文注释：根据显式分组参数覆盖默认 width/height/fps 分组；无参数时保持既有行为。
+    grouping_strategy = resolve_grouping_strategy(args)
+    detailed_groups = None
+    if grouping_strategy:
+        file_infos = _file_infos_from_probe_rows(files, input_probe_map)
+        try:
+            if grouping_strategy == "regex":
+                detailed_groups = group_by_regex(file_infos, args.grp_regex)
+            elif grouping_strategy == "time_segments":
+                detailed_groups = group_by_time_segments(file_infos, parse_time_segments(args.time_segments))
+            elif grouping_strategy == "time_interval":
+                detailed_groups = group_by_time_interval(file_infos, _parse_interval_hours(args.grp_by_time))
+            elif grouping_strategy == "prefix":
+                detailed_groups = group_by_filename_prefix(file_infos, args.grp_prefix)
+        except Exception as ex:
+            print(f"Error: invalid grouping arguments: {ex}"); sys.exit(2)
+        groups = _groups_to_legacy_dicts(detailed_groups)
+        print_group_summary(detailed_groups, args.timezone, output_dir=work_root)
+    elif not args.group:
+        # 中文注释：未指定任何新分组策略时默认不分组；--group 保留旧的分辨率/FPS 分组行为。
+        groups = [{"group_id":0, "prefix":"all", "time_range":"", "files":[{"path":str(f)} for f in files]}]
+
     # write groups summary
     grp_rows = []
     for g in groups:
-        grp_rows.append({"group":g["group_id"], "width":g["width"], "height":g["height"], "fps":g["fps"], "count":len(g["files"])})
-    write_csv(groups_csv, ["group","width","height","fps","count"], grp_rows)
+        grp_rows.append({"group":g["group_id"], "prefix":g.get("prefix", g["group_id"]), "time_range":g.get("time_range", ""),
+                         "width":g.get("width"), "height":g.get("height"), "fps":g.get("fps"), "count":len(g["files"])})
+    write_csv(groups_csv, ["group","prefix","time_range","width","height","fps","count"], grp_rows)
     write_csv(pre_media_csv, ["path","width","height","fps","codec","duration","bitrate"], entries)
     print("Preflight and media info written to work folder.")
 
     if args.show_groups_only:
         print("Groups summary:")
         for g in groups:
-            print(f"  Group {g['group_id']}: {g['width']}x{g['height']} @ {g['fps']} fps, files={len(g['files'])}")
+            print(f"  Group {g['group_id']} ({g.get('prefix', g['group_id'])}): {g.get('width')}x{g.get('height')} @ {g.get('fps')} fps, files={len(g['files'])}")
         print("Show-groups-only requested. Exiting before task generation.")
         sys.exit(0)
 
@@ -1230,14 +1654,13 @@ EXAMPLES:
                 print(f"  Group {k}: encoder={v['encoder']}, codec={v['codec']}, cfg_rc={v['rc_mode']}, cfg_cqp={v['cqp']}, cfg_preset={v['preset']}, scale={v['scale']}")
                 if str(v["encoder"]).lower() == "nvenc":
                     print("           effective NVENC: rc=vbr, cq=18, preset=p7, tune=uhq, aq=12, lookahead=64, multipass=fullres")
-            if not args.skip_builtin_checks:
-                c = input("Confirm and proceed? (y/N): ").strip().lower()
-                if c != "y": print("Aborted"); sys.exit(0)
+            # FIX: --skip skips all interactive confirmation prompts.
+            print("[--skip] 跳过配置确认")
         else:
             # interactive: prompt per-group
             for g in groups:
                 gid = g["group_id"]
-                w,h = g["width"], g["height"]
+                w,h = g.get("width"), g.get("height")
                 cqp_fixed = 24
                 print(f"\nGroup {gid}: {w}x{h} @ {g['fps']} fps  files:{len(g['files'])}")
                 print(f"Fixed CRF/CQ: {cqp_fixed}")
@@ -1260,19 +1683,24 @@ EXAMPLES:
                     outp.parent.mkdir(parents=True, exist_ok=True)
                 else:
                     outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
+                outp = _apply_group_output_template(outp, g.get("prefix", g["group_id"]))
                 outp = _apply_container_policy(srcp, outp)
                 outp = _resolve_output_conflict(outp, srcp)
                 tasks.append(make_task(srcp, outp, g["group_id"], cfg, src_duration_sec=src_duration_map.get(str(srcp))))
+
+    _print_task_commands(tasks)
+    # FIX: --skip skips final confirmation for custom/non-interactive runs.
+    if args.skip:
+        print("[--skip] 跳过确认，直接执行")
+    elif not args.skip_builtin_checks:
+        c = input("Confirm FFmpeg commands and proceed? (y/N): ").strip().lower()
+        if c != "y":
+            print("Aborted"); sys.exit(0)
 
     # write preflight tasks
     with tasks_json.open("w", encoding='utf-8') as jf:
         json.dump(tasks, jf, indent=2, ensure_ascii=False)
     print(f"Tasks preflight saved to: {tasks_json}  (total: {len(tasks)})")
-    # confirm if not skip
-    if not args.skip:
-        c = input("Proceed to execute tasks now? (y/N): ").strip().lower()
-        if c != "y":
-            print("Aborted"); sys.exit(0)
     # determine logs root
     if is_single_file:
         logs_dir = src.parent.joinpath(f"{src.stem}_logs")
@@ -1284,6 +1712,7 @@ EXAMPLES:
     logs_dir.mkdir(parents=True, exist_ok=True)
     # execute
     failed_tasks = execute_tasks(tasks, args.concurrency, work_root, result_csv, logs_dir, timeout=args.timeout, show_progress=True)
+    _summarize_params(tasks)
     # post media info
     out_entries = []
     for t in tasks:

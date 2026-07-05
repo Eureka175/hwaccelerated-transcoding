@@ -199,3 +199,122 @@ python3 transcode_hw_main.py \
 - 硬件编码失败：先用 `--query-params` 检查编码器可用性，再确认驱动、设备映射和容器权限；脚本会自动尝试一次 CPU 回退。
 - 音频校验失败：查看 `audio_verify.csv` 的 `note` 字段以及对应任务日志。常见原因包括自定义参数重编码音频、输出容器不支持某些音频流、源文件音频探测信息异常。
 - 批量任务过慢或失败多：把 `--concurrency` 调低到 `1`，并使用 `--timeout` 防止单任务卡死。
+
+## 9. 输入文件探测
+
+脚本现在会在生成任何编码任务前先调用 `ffprobe` 探测每个输入文件主视频流的像素格式，并由此推导：
+
+- 位深：例如 `8bit` / `10bit`。
+- 色度采样：例如 `4:2:0` / `4:2:2` / `4:4:4`。
+- 探测时间：UTC ISO 风格时间戳。
+
+探测结果会写入工作目录：
+
+- `input_probe.csv`：字段包含 `file_path,bit_depth,chroma_subsampling,pixel_format,probe_time`。
+- `preflight_files.csv`：在原有媒体信息基础上同步附加 `bit_depth,chroma_subsampling,probe_time`，便于和任务日志一起归档。
+
+## 10. 编码器兼容性与 fallback 策略
+
+任务生成阶段会调用 `ffmpeg -encoders` 和 `ffmpeg -h encoder=<encoder>` 探测当前 FFmpeg 可用的 HEVC 硬件编码器能力，并写入 `encoder_capabilities.csv`：
+
+- `hevc_nvenc`
+- `hevc_qsv`
+- `hevc_amf`
+
+CSV 字段包含 `encoder_name,available,supported_profiles,supported_pixel_formats,probe_time`。
+
+兼容性处理策略：
+
+1. 当输入/输出位深与色度采样可由能力表支持时，脚本不主动指定 `-pix_fmt`，尽量让 FFmpeg 保持输入输出格式一致。
+2. 当输入格式可能不被所选硬件路径支持时，脚本打印 `WARNING`，并自动移除 `-hwaccel` 相关参数，改用 CPU 软解后继续硬件编码。
+3. 使用 `--skip-check`（等价于 `--skip-builtin-checks`）时会跳过确认提示，但仍打印完整 FFmpeg 命令；脚本会按阶梯设置输出格式 fallback：10bit 输入优先 `p010le`，否则使用 `yuv420p`。
+4. 每次 fallback 都会打印 `WARNING`，并在编码后输出实际参数摘要。
+
+## 11. AMD AMF 参数说明
+
+AMF 会根据输入位深自动选择不同模板：
+
+- 10bit 输入：使用 `hevc_amf` + `-pix_fmt p010le` + CQP 参数。
+- 8bit 输入：使用 `hevc_amf` + `-pix_fmt yuv420p` + HQVBR 参数。
+
+> 作者无 AMD 显卡进行实际验证，AMF 参数仅通过查阅 FFmpeg 文档及 AMD 官方资料整理，实际运行可能存在兼容性问题，欢迎 AMD 用户反馈。
+
+## 12. 新增/更新参数
+
+- `--skip-check`：`--skip-builtin-checks` 的别名。跳过执行前确认与严格检查，适合无人值守批处理；仍会打印完整 FFmpeg 命令和 fallback 后的实际参数摘要。
+
+## 13. 时间分组
+
+脚本会在输入探测阶段读取 `format.tags.creation_time`，并按 `--timezone` 转换为本地时间。默认 `--timezone 8`，即 BJT/UTC+8；允许范围为 `-12` 到 `+14`。
+
+常用参数：
+
+- `--grp-by-time 2h`：按固定 2 小时间隔分组，前缀格式为 `YYYYMMDD_HHMM-HHMM`。
+- `--grp-by-time 4h` / `--grp-by-time 6h`：按 4 小时或 6 小时间隔分组。
+- `--time-segments "05:00-08:00=dawn,08:00-12:00=morning,12:00-18:00=afternoon,18:00-22:00=evening,22:00-05:00=night"`：按自定义命名时段分组，支持 `22:00-05:00` 这种跨天时段。
+- `--timezone 8`：把 UTC `creation_time` 转为本地时间后再分组。
+
+“从早拍到晚”的示例：
+
+```bash
+python3 transcode_hw_main.py \
+  --src ./shooting_day \
+  --dst ./out \
+  --work ./work \
+  --timezone 8 \
+  --time-segments "05:00-08:00=dawn,08:00-12:00=morning,12:00-18:00=afternoon,18:00-22:00=evening,22:00-05:00=night" \
+  --skip
+```
+
+探测 CSV 会包含：`file_path,bit_depth,chroma_subsampling,creation_time_utc,creation_time_local,timezone_offset,probe_time`。
+
+## 14. Regex 分组
+
+`--grp-regex` 会按文件名正则的**第一个捕获组**分组，未匹配文件进入 `ungrouped`。
+
+示例：
+
+```bash
+# 提取前 8 位日期，例如 20260704_C0797.MP4 -> 20260704
+python3 transcode_hw_main.py --src ./media --grp-regex "^(\d{8})" --skip
+
+# 按相机前缀分组，例如 DSC_0001 / IMG_0001
+python3 transcode_hw_main.py --src ./media --grp-regex "^(DSC|IMG)_(\d{4})" --skip
+
+# 匹配 YYYY-MM-DD 日期前缀
+python3 transcode_hw_main.py --src ./media --grp-regex "^(\d{4}-\d{2}-\d{2})" --skip
+```
+
+## 15. 分组输出
+
+分组摘要会在终端限量打印：最多显示 10 组，每组最多显示 5 个文件，避免大批量素材刷屏。完整分组明细会写入工作目录中的 `group_detail_YYYYMMDD_HHMMSS.txt` 与 `group_detail_YYYYMMDD_HHMMSS.csv`。
+
+`--output-dir` 等价于 `--dst`，并支持 `{prefix}` 模板变量，把不同分组输出到独立目录：
+
+```bash
+python3 transcode_hw_main.py \
+  --src ./media \
+  --output-dir "./out/{prefix}" \
+  --grp-by-time 2h \
+  --skip
+```
+
+## 16. 兼容性 Fallback
+
+`--skip-check`（同 `--skip-builtin-checks`）会跳过确认提示，但仍打印完整 FFmpeg 命令和最终参数摘要。启用该模式后，输出格式 fallback 阶梯为：
+
+1. 10bit 输入优先尝试 `p010le`（10bit 4:2:0）。
+2. 仍不兼容时可降级为 `yuv420p`（8bit 4:2:0）。
+3. 每次降级都会打印 `WARNING` 并在任务摘要中记录实际输出格式。
+
+当输入格式可能不被硬件解码路径支持时，脚本会打印 `WARNING` 并移除 `-hwaccel`，改用 CPU 软解后继续硬件编码。
+
+## 17. 参数优先级
+
+分组参数优先级固定为：
+
+```text
+--grp-regex > --time-segments > --grp-by-time > --grp-prefix
+```
+
+如果未指定任何分组参数，默认不分组；如需保留旧版按分辨率/FPS 分组行为，可显式使用 `--group`。
