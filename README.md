@@ -242,3 +242,79 @@ AMF 会根据输入位深自动选择不同模板：
 ## 12. 新增/更新参数
 
 - `--skip-check`：`--skip-builtin-checks` 的别名。跳过执行前确认与严格检查，适合无人值守批处理；仍会打印完整 FFmpeg 命令和 fallback 后的实际参数摘要。
+
+## 13. 时间分组
+
+脚本会在输入探测阶段读取 `format.tags.creation_time`，并按 `--timezone` 转换为本地时间。默认 `--timezone 8`，即 BJT/UTC+8；允许范围为 `-12` 到 `+14`。
+
+常用参数：
+
+- `--grp-by-time 2h`：按固定 2 小时间隔分组，前缀格式为 `YYYYMMDD_HHMM-HHMM`。
+- `--grp-by-time 4h` / `--grp-by-time 6h`：按 4 小时或 6 小时间隔分组。
+- `--time-segments "05:00-08:00=dawn,08:00-12:00=morning,12:00-18:00=afternoon,18:00-22:00=evening,22:00-05:00=night"`：按自定义命名时段分组，支持 `22:00-05:00` 这种跨天时段。
+- `--timezone 8`：把 UTC `creation_time` 转为本地时间后再分组。
+
+“从早拍到晚”的示例：
+
+```bash
+python3 transcode_hw_main.py \
+  --src ./shooting_day \
+  --dst ./out \
+  --work ./work \
+  --timezone 8 \
+  --time-segments "05:00-08:00=dawn,08:00-12:00=morning,12:00-18:00=afternoon,18:00-22:00=evening,22:00-05:00=night" \
+  --skip
+```
+
+探测 CSV 会包含：`file_path,bit_depth,chroma_subsampling,creation_time_utc,creation_time_local,timezone_offset,probe_time`。
+
+## 14. Regex 分组
+
+`--grp-regex` 会按文件名正则的**第一个捕获组**分组，未匹配文件进入 `ungrouped`。
+
+示例：
+
+```bash
+# 提取前 8 位日期，例如 20260704_C0797.MP4 -> 20260704
+python3 transcode_hw_main.py --src ./media --grp-regex "^(\d{8})" --skip
+
+# 按相机前缀分组，例如 DSC_0001 / IMG_0001
+python3 transcode_hw_main.py --src ./media --grp-regex "^(DSC|IMG)_(\d{4})" --skip
+
+# 匹配 YYYY-MM-DD 日期前缀
+python3 transcode_hw_main.py --src ./media --grp-regex "^(\d{4}-\d{2}-\d{2})" --skip
+```
+
+## 15. 分组输出
+
+分组摘要会在终端限量打印：最多显示 10 组，每组最多显示 5 个文件，避免大批量素材刷屏。完整分组明细会写入工作目录中的 `group_detail_YYYYMMDD_HHMMSS.txt` 与 `group_detail_YYYYMMDD_HHMMSS.csv`。
+
+`--output-dir` 等价于 `--dst`，并支持 `{prefix}` 模板变量，把不同分组输出到独立目录：
+
+```bash
+python3 transcode_hw_main.py \
+  --src ./media \
+  --output-dir "./out/{prefix}" \
+  --grp-by-time 2h \
+  --skip
+```
+
+## 16. 兼容性 Fallback
+
+`--skip-check`（同 `--skip-builtin-checks`）会跳过确认提示，但仍打印完整 FFmpeg 命令和最终参数摘要。启用该模式后，输出格式 fallback 阶梯为：
+
+1. 10bit 输入优先尝试 `p010le`（10bit 4:2:0）。
+2. 仍不兼容时可降级为 `yuv420p`（8bit 4:2:0）。
+3. 每次降级都会打印 `WARNING` 并在任务摘要中记录实际输出格式。
+
+当输入格式可能不被硬件解码路径支持时，脚本会打印 `WARNING` 并移除 `-hwaccel`，改用 CPU 软解后继续硬件编码。
+
+## 17. 参数优先级
+
+分组参数优先级固定为：
+
+```text
+--grp-regex > --time-segments > --grp-by-time > --grp-prefix
+```
+
+如果未指定任何分组参数，默认不分组；如需保留旧版按分辨率/FPS 分组行为，可显式使用 `--group`。
