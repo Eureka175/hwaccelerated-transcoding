@@ -1,320 +1,437 @@
-# hwaccelerated-transcoding
+# transcode_hw_main
 
-一个面向素材批处理场景的 **FFmpeg 硬件转码脚本**。主脚本为 `transcode_hw_main.py`，支持 `NVENC / QSV / AMF` 硬件编码、自定义 FFmpeg 参数、分组批处理、失败回退和音频校验。
+面向素材批处理场景的 **FFmpeg 硬件转码工具**，支持 `NVENC` / `QSV` / `AMF` 三平台硬件编码，内置最大化画质参数模板，支持智能分组、多硬件并发调度、音频时长验证与失败自动隔离。
 
-## 1. 当前能力
+---
 
-- 支持单文件或目录输入。
-- 目录模式支持递归扫描、扩展名过滤、文件名前缀/后缀过滤与反选。
-- 默认按 `width / height / fps` 分组；`--no-group` 可把所有输入视为一组。
-- 支持交互配置，也支持 `--skip --skip-builtin-checks` 非交互执行。
-- 支持 `--custom-params` 直接注入 FFmpeg 参数。
-- 默认只重编码主视频流，音频流单独抽取后以 `copy` 方式混回输出文件。
-- 硬件编码失败时会自动尝试一次 CPU 回退。
-- 生成 preflight、分组、任务结果、转码前后媒体信息、音频校验和逐任务日志。
+## 1. 获取最新版本
 
-## 2. 环境要求
+从 [GitHub Releases](https://github.com/yourusername/transcode_hw/releases) 下载最新版本：
 
-- Python 3.8+
-- FFmpeg
-- FFprobe
-- 目标硬件编码器对应的驱动、运行时和设备权限
+- **Windows 分发包**: `transcode_hw_vX.X.zip`（内含 `transcode_hw_main.exe` + `ffmpeg/` + `README.md`）
+- 解压到任意目录即可使用，无需安装 Python 或 FFmpeg
+
+> 若首次使用，建议下载最新 Release 而非手动克隆仓库。
+
+---
+
+## 1. 环境要求
+
+- **Windows 10/11**（x64）
+- **Python 3.8+**（仅开发/调试时需要，分发版无需安装）
+- **FFmpeg + FFprobe**（打包时自动包含，或系统已安装）
+- **对应显卡驱动**（NVENC 需 NVIDIA 驱动，QSV 需 Intel 驱动，AMF 需 AMD 驱动）
 
 快速自检：
 
 ```bash
-python3 --version
 ffmpeg -version
 ffprobe -version
-ffmpeg -encoders | rg -E "(h264_nvenc|hevc_nvenc|h264_qsv|hevc_qsv|h264_amf|hevc_amf)"
+ffmpeg -encoders | findstr "hevc_nvenc hevc_qsv hevc_amf"
 ```
 
-没有 `rg` 时可直接运行 `ffmpeg -encoders` 后手动搜索 `nvenc/qsv/amf`。
+---
 
-## 3. 输出与工作目录
+## 2. 快速开始
 
-- `--src`：输入文件或输入目录。
-- `--dst`：输出目录；省略时会在源路径同级创建 `<src>_comp`。
-- `--work`：工作目录；省略时会在源路径同级创建 `<src>_work`。
-- 单文件模式也会输出到 `--dst` 指定目录；没有 `--dst` 时输出到 `<src>_comp`。
-- 默认保持输入文件名；目标冲突或目标等于源文件时自动追加 `_comp`、`_comp2` 等后缀。
-- `--out-suffix` 可追加输出文件名后缀，例如 `--out-suffix deliver` 会生成 `_deliver` 后缀。
-- `--flat-output` 可把目录批处理结果平铺到同一个输出目录。
+### 解压即用
 
-## 4. 典型用法
+1. 下载 `transcode_hw_vX.X.zip` 并解压到任意目录（如 `D:\tools\transcode_hw`）
+2. 双击 `transcode_hw_main.exe` 查看帮助提示
+3. 在弹出的 CMD 窗口中输入命令运行
 
-### 4.1 查询编码器参数
-
-```bash
-python3 transcode_hw_main.py --query-params nvenc --work ./work
-python3 transcode_hw_main.py --query-params qsv --work ./work
-python3 transcode_hw_main.py --query-params amf --work ./work
+```cmd
+transcode_hw_main.exe --src "F:\素材" --dst "F:\输出" --skip
 ```
 
-### 4.2 单文件非交互转码
+> 首次双击会弹出 CMD 窗口并显示使用说明，窗口保持打开，可直接输入命令运行。
+
+### 2.1 单文件转码
 
 ```bash
-python3 transcode_hw_main.py \
-  --src ./video.mp4 \
-  --dst ./out \
-  --work ./work \
-  --skip \
-  --skip-builtin-checks
+transcode_hw_main.exe --src "F:\素材\video.mp4" --dst "F:\输出" --skip
 ```
 
-### 4.3 目录批量非交互转码
+### 2.2 目录批量（默认 NVENC，不分组）
 
 ```bash
-python3 transcode_hw_main.py \
-  --src ./materials \
-  --dst ./out \
-  --work ./work \
-  --skip \
-  --skip-builtin-checks
+transcode_hw_main.exe --src "F:\素材" --dst "F:\输出" --work "F:\工作" --skip
 ```
 
-### 4.4 关闭分组，所有文件使用同一套参数
+### 2.3 按拍摄日期自动分组 + 多硬件并发
 
 ```bash
-python3 transcode_hw_main.py \
-  --src ./materials \
-  --dst ./out \
-  --work ./work \
-  --no-group \
-  --encoder nvenc \
-  --codec hevc \
-  --skip \
-  --skip-builtin-checks
+transcode_hw_main.exe --src "F:\素材" --dst "F:\输出" --work "F:\工作" ^
+  --grp-auto --hardware-pool "nvenc:2,qsv:1" --skip
 ```
 
-### 4.5 递归扫描并筛选扩展名
+### 2.4 按时段分组（解决"从早拍到晚"）
 
 ```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --recursive \
-  --extensions mp4,mov,mxf \
-  --dst ./out \
-  --work ./work \
-  --skip \
-  --skip-builtin-checks
-```
-
-### 4.6 使用自定义 FFmpeg 参数
-
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --dst ./out \
-  --work ./work \
-  --custom-params "-c:v libx264 -crf 20 -c:a aac -b:a 192k" \
+transcode_hw_main.exe --src "F:\素材" --dst "F:\输出" --work "F:\工作" ^
+  --time-segments "05:00-08:00=dawn,08:00-12:00=morning,12:00-18:00=afternoon,18:00-22:00=evening,22:00-05:00=night" ^
   --skip
 ```
 
-`--custom-params` 不要包含输出文件名。该模式会按用户提供的参数执行，不套用脚本内置的视频编码、音频 copy、强制质量等策略。
-
-### 4.7 只生成分组和媒体探测信息
+### 2.5 覆写模板参数
 
 ```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --work ./work \
-  --show-groups-only
+transcode_hw_main.exe --src "F:\素材" --encoder nvenc ^
+  --override-params "-cq 16 -rc-lookahead 32" --skip
 ```
 
-## 5. 关键参数
-
-### 5.1 输入筛选
-
-- `--recursive`：递归处理子目录。
-- `--extensions`：扩展名白名单，默认 `mp4,mov`。
-- `--prefixes` / `--suffixes`：文件名前缀/后缀白名单。
-- `--invert-prefix` / `--invert-suffix`：排除命中白名单的文件。
-
-### 5.2 编码参数
-
-- `--encoder {nvenc,qsv,amf}`：硬件编码后端，默认 `nvenc`。
-- `--codec {hevc,h264}`：视频编码格式，默认 `hevc`。
-- `--rc-mode {vbr,cbr,cqp,icq}`：码控方式；非交互默认使用 `cqp`。
-- `--min-br` / `--max-br`：VBR/CBR 码率参数，单位 Mbps。
-- `--cqp`：CQP/ICQ 质量值。
-- `--preset`：传给底层编码器的 FFmpeg 参数；NVENC 最终仍会受到默认强制质量策略影响，除非使用 `--nvenc-qual` 手动覆盖。
-
-### 5.3 强制质量策略
-
-普通模式下脚本会在最终命令中加入以下硬件编码质量参数：
-
-- NVENC：`-preset p7`
-- QSV：`-tu 1`
-- AMF：`-quality quality`
-
-可用以下参数改写：
-
-- `--nvenc-qual p7`
-- `--qsv-qual tu1` 或 `--qsv-qual 1`
-- `--amf-qual quality`
-
-`--custom-params` 模式不应用这些自动策略。
-
-### 5.4 执行控制
-
-- `--skip`：跳过交互配置。
-- `--skip-builtin-checks`：跳过执行前确认，适合 CI 或无人值守任务。
-- `--concurrency`：并发 FFmpeg 进程数。
-- `--timeout`：单任务超时秒数。
-- `--show-groups-only`：写出探测和分组文件后退出。
-
-## 6. 音频、元数据与容器策略
-
-普通模式下脚本会优先保护源音频：
-
-1. 源文件有音频时，先把音频流抽取到临时 `.mka`，编码视频，再把视频和音频以 `-c:a copy` 混回输出。
-2. 源文件无音频时跳过音频抽取步骤，只执行视频转码。
-3. 任务完成后先校验音频流数量；全部任务结束后写出 `audio_verify.csv`，逐条校验音频流数量、声道数、采样率、可用声道布局、时长差异和解码后的 PCM 哈希。
-4. 自定义参数模式由用户自己控制音频参数，脚本不会强制 `copy`。
-
-容器与元数据策略：
-
-- 默认保留输入元数据和章节。
-- 默认只重编码主视频流 `0:v:0`，避免附加封面图等视频流被误重编码。
-- MOV 输出会尽量保留数据流和附件流。
-- MP4 输出仅保留常见可封装的数据流，例如 `tmcd/gpmd/camm/mett/metx/rtmd`。
-- 探测到 metadata/data/附件等扩展流时，会自动把该文件输出为 MOV，以提高封装兼容性。
-
-## 7. 产物说明
-
-工作目录会包含：
-
-- `preflight_files.csv`：输入文件探测结果。
-- `groups_summary.csv`：分组汇总。
-- `tasks_preflight.json`：执行前任务清单和命令。
-- `tasks_result.csv`：每个任务的最终命令、日志、返回码和备注。
-- `pre_media_info.csv` / `post_media_info.csv`：转码前后主视频流信息。
-- `audio_verify.csv`：转码后音频校验结果。
-- `logs/` 或输出目录同级 `*_logs/`：逐任务 FFmpeg 日志。
-
-## 8. 故障排查
-
-- `ffmpeg-not-found`：确认 FFmpeg/FFprobe 已安装并在 `PATH` 中。
-- 硬件编码失败：先用 `--query-params` 检查编码器可用性，再确认驱动、设备映射和容器权限；脚本会自动尝试一次 CPU 回退。
-- 音频校验失败：查看 `audio_verify.csv` 的 `note` 字段以及对应任务日志。常见原因包括自定义参数重编码音频、输出容器不支持某些音频流、源文件音频探测信息异常。
-- 批量任务过慢或失败多：把 `--concurrency` 调低到 `1`，并使用 `--timeout` 防止单任务卡死。
-
-## 9. 输入文件探测
-
-脚本现在会在生成任何编码任务前先调用 `ffprobe` 探测每个输入文件主视频流的像素格式，并由此推导：
-
-- 位深：例如 `8bit` / `10bit`。
-- 色度采样：例如 `4:2:0` / `4:2:2` / `4:4:4`。
-- 探测时间：UTC ISO 风格时间戳。
-
-探测结果会写入工作目录：
-
-- `input_probe.csv`：字段包含 `file_path,bit_depth,chroma_subsampling,pixel_format,probe_time`。
-- `preflight_files.csv`：在原有媒体信息基础上同步附加 `bit_depth,chroma_subsampling,probe_time`，便于和任务日志一起归档。
-
-## 10. 编码器兼容性与 fallback 策略
-
-任务生成阶段会调用 `ffmpeg -encoders` 和 `ffmpeg -h encoder=<encoder>` 探测当前 FFmpeg 可用的 HEVC 硬件编码器能力，并写入 `encoder_capabilities.csv`：
-
-- `hevc_nvenc`
-- `hevc_qsv`
-- `hevc_amf`
-
-CSV 字段包含 `encoder_name,available,supported_profiles,supported_pixel_formats,probe_time`。
-
-兼容性处理策略：
-
-1. 当输入/输出位深与色度采样可由能力表支持时，脚本不主动指定 `-pix_fmt`，尽量让 FFmpeg 保持输入输出格式一致。
-2. 当输入格式可能不被所选硬件路径支持时，脚本打印 `WARNING`，并自动移除 `-hwaccel` 相关参数，改用 CPU 软解后继续硬件编码。
-3. 使用 `--skip-check`（等价于 `--skip-builtin-checks`）时会跳过确认提示，但仍打印完整 FFmpeg 命令；脚本会按阶梯设置输出格式 fallback：10bit 输入优先 `p010le`，否则使用 `yuv420p`。
-4. 每次 fallback 都会打印 `WARNING`，并在编码后输出实际参数摘要。
-
-## 11. AMD AMF 参数说明
-
-AMF 会根据输入位深自动选择不同模板：
-
-- 10bit 输入：使用 `hevc_amf` + `-pix_fmt p010le` + CQP 参数。
-- 8bit 输入：使用 `hevc_amf` + `-pix_fmt yuv420p` + HQVBR 参数。
-
-> 作者无 AMD 显卡进行实际验证，AMF 参数仅通过查阅 FFmpeg 文档及 AMD 官方资料整理，实际运行可能存在兼容性问题，欢迎 AMD 用户反馈。
-
-## 12. 新增/更新参数
-
-- `--skip-check`：`--skip-builtin-checks` 的别名。跳过执行前确认与严格检查，适合无人值守批处理；仍会打印完整 FFmpeg 命令和 fallback 后的实际参数摘要。
-
-## 13. 时间分组
-
-脚本会在输入探测阶段读取 `format.tags.creation_time`，并按 `--timezone` 转换为本地时间。默认 `--timezone 8`，即 BJT/UTC+8；允许范围为 `-12` 到 `+14`。
-
-常用参数：
-
-- `--grp-by-time 2h`：按固定 2 小时间隔分组，前缀格式为 `YYYYMMDD_HHMM-HHMM`。
-- `--grp-by-time 4h` / `--grp-by-time 6h`：按 4 小时或 6 小时间隔分组。
-- `--time-segments "05:00-08:00=dawn,08:00-12:00=morning,12:00-18:00=afternoon,18:00-22:00=evening,22:00-05:00=night"`：按自定义命名时段分组，支持 `22:00-05:00` 这种跨天时段。
-- `--timezone 8`：把 UTC `creation_time` 转为本地时间后再分组。
-
-“从早拍到晚”的示例：
+### 2.6 音频转码（非 copy）
 
 ```bash
-python3 transcode_hw_main.py \
-  --src ./shooting_day \
-  --dst ./out \
-  --work ./work \
-  --timezone 8 \
-  --time-segments "05:00-08:00=dawn,08:00-12:00=morning,12:00-18:00=afternoon,18:00-22:00=evening,22:00-05:00=night" \
-  --skip
+transcode_hw_main.exe --src "F:\素材" --audio-codec aac --audio-bitrate 320k --skip
 ```
 
-探测 CSV 会包含：`file_path,bit_depth,chroma_subsampling,creation_time_utc,creation_time_local,timezone_offset,probe_time`。
-
-## 14. Regex 分组
-
-`--grp-regex` 会按文件名正则的**第一个捕获组**分组，未匹配文件进入 `ungrouped`。
-
-示例：
+### 2.7 按组分配不同编码器
 
 ```bash
-# 提取前 8 位日期，例如 20260704_C0797.MP4 -> 20260704
-python3 transcode_hw_main.py --src ./media --grp-regex "^(\d{8})" --skip
-
-# 按相机前缀分组，例如 DSC_0001 / IMG_0001
-python3 transcode_hw_main.py --src ./media --grp-regex "^(DSC|IMG)_(\d{4})" --skip
-
-# 匹配 YYYY-MM-DD 日期前缀
-python3 transcode_hw_main.py --src ./media --grp-regex "^(\d{4}-\d{2}-\d{2})" --skip
+transcode_hw_main.exe --src "F:\素材" --grp-auto ^
+  --group-encoder "0:nvenc,1:qsv" --skip
 ```
 
-## 15. 分组输出
+---
 
-分组摘要会在终端限量打印：最多显示 10 组，每组最多显示 5 个文件，避免大批量素材刷屏。完整分组明细会写入工作目录中的 `group_detail_YYYYMMDD_HHMMSS.txt` 与 `group_detail_YYYYMMDD_HHMMSS.csv`。
+## 3. 分发与运行
 
-`--output-dir` 等价于 `--dst`，并支持 `{prefix}` 模板变量，把不同分组输出到独立目录：
+### 3.1 直接使用（推荐）
+
+下载 `transcode_hw_v1.0.zip`，解压到任意目录：
+
+```
+D:\tools\transcode_hw\
+├── transcode_hw_main.exe
+├── ffmpeg\
+│   ├── ffmpeg.exe
+│   └── ffprobe.exe
+└── README.md
+```
+
+**双击运行**：会弹出 CMD 窗口并显示使用提示，**窗口保持打开**，可直接输入命令。
+
+**命令行运行**：
+```bash
+cd D:\tools\transcode_hw
+transcode_hw_main.exe --src "F:\素材" --skip
+```
+
+### 3.2 自行打包
 
 ```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --output-dir "./out/{prefix}" \
-  --grp-by-time 2h \
-  --skip
+# 确保 build.py 与 transcode_hw_main.py 同目录
+python build.py
 ```
 
-## 16. 兼容性 Fallback
+`build.py` 会自动：
+1. 使用指定 Python 环境（默认 `C:\Users\吴汶睿\AppData\Local\Programs\Python\Python313`）
+2. 查找系统中的 `ffmpeg.exe` / `ffprobe.exe`
+3. 安装 PyInstaller（若未安装）
+4. 打包为单文件 `transcode_hw_main.exe`
+5. 生成 `transcode_hw_v1.0.zip`
 
-`--skip-check`（同 `--skip-builtin-checks`）会跳过确认提示，但仍打印完整 FFmpeg 命令和最终参数摘要。启用该模式后，输出格式 fallback 阶梯为：
+---
 
-1. 10bit 输入优先尝试 `p010le`（10bit 4:2:0）。
-2. 仍不兼容时可降级为 `yuv420p`（8bit 4:2:0）。
-3. 每次降级都会打印 `WARNING` 并在任务摘要中记录实际输出格式。
+## 4. 分组策略
 
-当输入格式可能不被硬件解码路径支持时，脚本会打印 `WARNING` 并移除 `-hwaccel`，改用 CPU 软解后继续硬件编码。
+脚本支持五种分组方式，**优先级固定**：
 
-## 17. 参数优先级
-
-分组参数优先级固定为：
-
-```text
---grp-regex > --time-segments > --grp-by-time > --grp-prefix
+```
+--grp-auto > --grp-regex > --time-segments > --grp-by-time > --grp-prefix
 ```
 
-如果未指定任何分组参数，默认不分组；如需保留旧版按分辨率/FPS 分组行为，可显式使用 `--group`。
+未指定任何分组参数时，**不分组**，所有文件视为一组。
+
+### 4.1 自动前缀识别（`--grp-auto`）
+
+按文件名自动识别前缀，优先级：
+
+1. `YYYYMMDD` / `YYMMDD` / `YYYY-MM-DD`
+2. 连续字母前缀（如 `DSC_`, `IMG_`）
+3. 连续数字前缀
+
+```bash
+transcode_hw_main.exe --src "F:\素材" --grp-auto --skip
+```
+
+### 4.2 正则分组（`--grp-regex`）
+
+按正则第一个捕获组分组，未匹配归入 `ungrouped`。
+
+```bash
+transcode_hw_main.exe --src "F:\素材" --grp-regex "^(\d{8})" --skip
+```
+
+### 4.3 自定义时段分组（`--time-segments`）
+
+基于 `ffprobe` 读取的 `creation_time`（UTC 转本地），按时段分组。
+
+```bash
+transcode_hw_main.exe --src "F:\素材" --time-segments "08:00-12:00=morning,12:00-18:00=afternoon" --skip
+```
+
+支持跨天时段（如 `22:00-05:00`），未匹配文件归入 `ungrouped`。
+
+**时区**：默认 `--timezone 8`（BJT），范围 `-12` ~ `+14`。
+
+### 4.4 固定时间间隔（`--grp-by-time`）
+
+```bash
+transcode_hw_main.exe --src "F:\素材" --grp-by-time 4h --skip
+```
+
+前缀格式：`YYYYMMDD_HHMM-HHMM`
+
+### 4.5 固定前缀长度（`--grp-prefix`）
+
+```bash
+transcode_hw_main.exe --src "F:\素材" --grp-prefix 8 --skip
+```
+
+### 4.6 分组输出行为
+
+- **仅1组**：静默，不打印分组信息
+- **≥2组**：终端限量打印（最多10组，每组最多5个文件），完整明细写入外部文件
+
+---
+
+## 5. 多硬件调度
+
+支持为不同分组分配不同编码器，并限制每编码器的并发数。
+
+### 5.1 硬件并发池（`--hardware-pool`）
+
+```bash
+transcode_hw_main.exe --src "F:\素材" --hardware-pool "nvenc:2,qsv:1" --skip
+```
+
+### 5.2 按组分配编码器（`--group-encoder`）
+
+```bash
+transcode_hw_main.exe --src "F:\素材" --grp-auto --group-encoder "0:nvenc,1:qsv,2:amf" --skip
+```
+
+未指定的组使用 `--encoder` 默认值。
+
+### 5.3 全局并发上限（`--concurrency`）
+
+```bash
+transcode_hw_main.exe --src "F:\素材" --concurrency 3 --skip
+```
+
+---
+
+## 6. 音频编码策略
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--audio-codec` | `copy` | 可选 `aac` / `flac` / `opus` / `pcm_s16le` 等 |
+| `--audio-bitrate` | 无 | 仅对非 copy 生效 |
+
+**特殊规则**：
+- `--audio-codec aac` 且未指定 `--audio-bitrate` 时，**默认 320k**
+- `--audio-codec copy` 时 `--audio-bitrate` 被忽略并打印 WARNING
+
+---
+
+## 7. 参数覆写（`--override-params`）
+
+基于内置模板，覆写同名参数，保留其他参数。使用双引号包裹。
+
+```bash
+# NVENC 模板默认 cq 18，覆写为 20
+transcode_hw_main.exe --src "F:\素材" --encoder nvenc --override-params "-cq 20 -rc-lookahead 32" --skip
+
+# QSV 模板默认 global_quality 21，覆写为 18
+transcode_hw_main.exe --src "F:\素材" --encoder qsv --override-params "-global_quality 18" --skip
+```
+
+与 `--custom-params` 的区别：
+- `--override-params`：基于模板微调，只改差异项
+- `--custom-params`：完全替换整个命令（从 `-i` 之后）
+
+---
+
+## 8. 兼容性 Fallback
+
+### 8.1 硬件解码不支持 → CPU 软解
+
+当输入文件的位深/色度采样不被硬件解码器支持时，自动移除 `-hwaccel`，改用 CPU 软解后继续进行硬件编码。
+
+```
+WARNING: 10bit 4:2:2 not supported by nvenc; using CPU decode
+```
+
+### 8.2 输出格式降级（`--skip-check`）
+
+启用 `--skip-check` 后，遇到不支持的输出格式时自动降级：
+
+| 输入 | 降级目标 | 说明 |
+|------|----------|------|
+| 10bit | `p010le` (10bit 420) | 保留位深，牺牲色度采样 |
+| 仍不支持 | `yuv420p` (8bit 420) | 最终降级 |
+
+每次降级打印 WARNING。
+
+---
+
+## 9. CPU Fallback
+
+硬件编码失败后，可选择用 CPU 重新编码。
+
+**参数**：`libx265` / `libx264` `-preset slow` `-crf 18`，保持与硬件相同的音频策略。
+
+**交互行为**：
+- 非 `--skip` 模式：询问用户 `是否用 CPU 重新编码失败任务? (y/N)`
+- `--skip` 模式：自动执行，打印 WARNING
+
+**失败文件隔离**：最终仍失败的任务，源文件自动移入 `error/` 目录。
+
+---
+
+## 10. 输出文件说明
+
+### 10.1 工作目录（`--work` 或 `<src>_work/`）
+
+| 文件 | 说明 |
+|------|------|
+| `input_probe.csv` | 输入文件探测结果（位深、色度采样、creation_time 等） |
+| `encoder_capabilities.csv` | 系统硬件编码器能力表 |
+| `group_detail_YYYYMMDD_HHMMSS.txt` | 分组详情（人类可读） |
+| `group_detail_YYYYMMDD_HHMMSS.csv` | 分组详情（机器可读） |
+| `tasks_result.csv` | 每个任务的执行结果（返回码、耗时、备注） |
+| `audio_verify.csv` | 音频时长验证结果 |
+| `logs/*.log` | 每个任务的 FFmpeg 完整输出日志 |
+
+### 10.2 输出目录（`--dst` 或 `<src>_comp/`）
+
+转码后的视频文件，目录结构取决于 `--flat-output` 和分组策略。
+
+### 10.3 终端打印限制
+
+大批量素材时，终端只打印有限信息，完整明细写入外部文件：
+- 分组摘要：最多 10 组，每组最多 5 个文件
+- 完整列表：`group_detail_*.txt` / `*.csv`
+
+---
+
+## 11. 完整参数列表
+
+```
+--src PATH                    源文件或目录（必需）
+--dst PATH                    输出目录（默认 <src>_comp）
+--work PATH                   工作目录（默认 <src>_work）
+--recursive                   递归遍历子目录
+--timezone [-12..14]          时区偏移，默认 +8（BJT）
+
+分组：
+  --grp-auto                  自动按文件名前缀分组
+  --grp-by-time 2h/4h/6h     按固定时间间隔分组
+  --time-segments "HH:MM-HH:MM=label,..."  自定义时段分组
+  --grp-regex "PATTERN"       按正则第一个捕获组分组
+  --grp-prefix N              按文件名前 N 字符分组
+
+硬件：
+  --encoder {nvenc,qsv,amf}   默认编码器
+  --hardware-pool "nvenc:2,qsv:1"  多硬件并发池
+  --group-encoder "0:nvenc,1:qsv"  按组分配编码器
+  --codec {hevc,h264}         视频编码格式
+  --rc-mode {vbr,cbr,cqp,icq} 码控模式
+  --cqp INT                   CQP/CQ 质量值
+  --concurrency INT           全局并发上限
+
+音频：
+  --audio-codec CODEC         默认 copy，可选 aac/flac/opus/...
+  --audio-bitrate RATE        如 320k/256k（copy 时忽略）
+
+覆写：
+  --override-params "STRING"  覆写模板参数，如 "-cq 20 -bf 3"
+
+控制：
+  --skip                      跳过所有交互确认
+  --skip-check                跳过兼容性检查，启用输出格式降级
+  --timeout SECONDS           单任务超时
+  --show-groups-only          仅显示分组后退出
+  --flat-output               平铺输出（不保留目录结构）
+  --out-suffix SUFFIX         输出文件名后缀
+  --extensions "ext1,ext2"    文件扩展名过滤，默认 mp4,mov
+```
+
+---
+
+## 12. 编码器参数模板
+
+### NVENC
+
+```bash
+-c:v hevc_nvenc -preset p7 -tune uhq -profile:v rext
+-rc vbr -cq 18 -b:v 0
+-spatial_aq 1 -aq-strength 8 -temporal_aq 1
+-rc-lookahead 64 -lookahead_level auto
+-bf 4 -b_ref_mode middle -multipass fullres
+-g 240 -keyint_min 24
+```
+
+### QSV
+
+```bash
+-c:v hevc_qsv -preset veryslow -profile:v rext
+-rc icq -global_quality 21
+-look_ahead 1 -look_ahead_depth 100
+-adaptive_i 1 -adaptive_b 1 -b_strategy 1
+-bf 5 -refs 5 -rdo 1 -mbbrc 1 -extbrc 1
+-low_power 0 -async_depth 7
+-g 240 -keyint_min 24
+```
+
+### AMF（10bit 输入）
+
+```bash
+-c:v hevc_amf -preset quality -profile:v rext -pix_fmt p010le
+-rc cqp -qp_i 18 -qp_p 18 -qp_b 18
+-vbaq 1 -preanalysis 1 -pa_scene_change_detection 1
+-bf 3 -max_num_reframes 4
+-g 240 -keyint_min 24
+```
+
+### AMF（8bit 输入）
+
+```bash
+-c:v hevc_amf -preset quality -profile:v rext -pix_fmt yuv420p
+-rc hqvbr -qvbr_quality_level 18 -b:v 0
+-vbaq 1 -preanalysis 1 -pa_scene_change_detection 1
+-bf 3 -max_num_reframes 4
+-g 240 -keyint_min 24
+```
+
+### CPU Fallback
+
+```bash
+-c:v libx265 -preset slow -crf 18 -profile:v main10
+# 或 -c:v libx264 -preset slow -crf 18 -profile:v high
+```
+
+---
+
+## 13. 故障排查
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 双击 exe 弹出提示后无法输入 | 被安全软件拦截 | 以管理员运行或添加白名单 |
+| `ffmpeg-not-found` | FFmpeg 未在同级目录或 PATH | 确保 `ffmpeg/` 目录与 exe 同级 |
+| 硬件编码失败 | 驱动/权限/格式不支持 | 查看 `.log`，脚本会自动 fallback CPU |
+| 音频时长不匹配 | 容器封装问题或帧丢失 | 查看 `audio_verify.csv` |
+| 分组结果不对 | 文件名无规律或 creation_time 缺失 | 使用 `--grp-regex` 或 `--grp-prefix` |
+| 终端输出被截断 | 大批量素材的打印限制 | 查看 `group_detail_*.txt` |
+| AMD 编码失败 | 作者无 AMD 显卡验证 | 欢迎反馈，可改用 `--encoder qsv/nvenc` |
+| 打包失败 | Python 路径错误或 FFmpeg 未找到 | 修改 `build.py` 中 `TARGET_PYTHON` 变量 |
+
+---
+
+## 14. 免责声明
+
+- **AMF 参数**：作者无 AMD 显卡进行实际验证，AMF 参数仅通过查阅 FFmpeg 文档及 AMD 官方资料整理，实际运行可能存在兼容性问题，欢迎 AMD 用户反馈。
+- **CPU Fallback**：`libx265` / `libx264` 的 `-preset slow` 为保守选择，速度较慢但画质稳定。
+- **分发包**：包含的 FFmpeg 为 gyan.dev 静态编译版，遵循 GPL 协议。
