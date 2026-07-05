@@ -21,6 +21,32 @@ ACTIVE_PROCS_LOCK = threading.Lock()
 ACTIVE_PROCS = set()
 _FFMPEG_FILTERS_CACHE = None
 
+# AMF note: 作者无 AMD 显卡进行实际验证，AMF 参数仅通过查阅 FFmpeg 文档及 AMD 官方资料整理，实际运行可能存在兼容性问题，欢迎 AMD 用户反馈。
+ENCODER_PARAM_TEMPLATES = {
+    "nvenc": ["-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "uhq", "-profile:v", "rext",
+              "-rc", "vbr", "-cq", "18", "-b:v", "0", "-spatial_aq", "1", "-aq-strength", "8",
+              "-temporal_aq", "1", "-rc-lookahead", "64", "-lookahead_level", "auto", "-bf", "4",
+              "-b_ref_mode", "middle", "-multipass", "fullres", "-g", "240", "-keyint_min", "24"],
+    "qsv": ["-c:v", "hevc_qsv", "-preset", "veryslow", "-profile:v", "rext", "-rc", "icq",
+            "-global_quality", "21", "-look_ahead", "1", "-look_ahead_depth", "100", "-adaptive_i", "1",
+            "-adaptive_b", "1", "-b_strategy", "1", "-bf", "5", "-refs", "5", "-rdo", "1",
+            "-mbbrc", "1", "-extbrc", "1", "-low_power", "0", "-async_depth", "7", "-g", "240", "-keyint_min", "24"],
+    "amf_10bit": ["-c:v", "hevc_amf", "-preset", "quality", "-profile:v", "rext", "-pix_fmt", "p010le",
+                  "-rc", "cqp", "-qp_i", "18", "-qp_p", "18", "-qp_b", "18", "-vbaq", "1",
+                  "-preanalysis", "1", "-pa_scene_change_detection", "1", "-bf", "3", "-max_num_reframes", "4",
+                  "-g", "240", "-keyint_min", "24"],
+    "amf_8bit": ["-c:v", "hevc_amf", "-preset", "quality", "-profile:v", "rext", "-pix_fmt", "yuv420p",
+                 "-rc", "hqvbr", "-qvbr_quality_level", "18", "-b:v", "0", "-vbaq", "1",
+                 "-preanalysis", "1", "-pa_scene_change_detection", "1", "-bf", "3", "-max_num_reframes", "4",
+                 "-g", "240", "-keyint_min", "24"],
+}
+
+PIX_FMT_CAPS = {
+    "yuv420p": (8, "4:2:0"), "nv12": (8, "4:2:0"), "p010le": (10, "4:2:0"),
+    "yuv420p10le": (10, "4:2:0"), "yuv422p": (8, "4:2:2"), "yuv422p10le": (10, "4:2:2"),
+    "yuv444p": (8, "4:4:4"), "yuv444p10le": (10, "4:4:4"),
+}
+
 DEFAULT_FORCED_QUALITY_POLICY = {
     "nvenc": {"preset": "p7"},
     "qsv": {"tu": "1"},
@@ -77,6 +103,73 @@ def probe_media(path: Path):
         return {"width": width, "height": height, "codec": codec, "fps": round(fps,3), "duration": duration, "bitrate": bitrate}
     except Exception:
         return None
+
+
+def probe_input_format(path: Path):
+    cmd = ["ffprobe","-v","error","-select_streams","v:0","-show_entries",
+           "stream=pix_fmt,bits_per_raw_sample", "-of", "json", str(path)]
+    rc, out = run_cmd_capture(cmd)
+    pix_fmt = ""; raw_bits = ""
+    if rc == 0 and out:
+        try:
+            st = (json.loads(out).get("streams") or [{}])[0]
+            pix_fmt = str(st.get("pix_fmt") or "")
+            raw_bits = str(st.get("bits_per_raw_sample") or "")
+        except Exception:
+            pass
+    bit_depth, chroma = PIX_FMT_CAPS.get(pix_fmt, (None, "unknown"))
+    if not bit_depth:
+        if raw_bits.isdigit(): bit_depth = int(raw_bits)
+        elif "10" in pix_fmt or "p010" in pix_fmt: bit_depth = 10
+        elif pix_fmt: bit_depth = 8
+    return {"file_path": str(path), "bit_depth": f"{bit_depth}bit" if bit_depth else "unknown",
+            "chroma_subsampling": chroma, "pixel_format": pix_fmt, "probe_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+def probe_encoder_capabilities():
+    rc, encoders = run_cmd_capture(["ffmpeg", "-hide_banner", "-encoders"])
+    rows = []
+    for enc in ["hevc_nvenc", "hevc_qsv", "hevc_amf"]:
+        available = int(rc == 0 and enc in encoders)
+        profiles, pix_fmts = [], []
+        if available:
+            _, help_text = run_cmd_capture(["ffmpeg", "-hide_banner", "-h", f"encoder={enc}"])
+            for line in help_text.splitlines():
+                low = line.lower()
+                if "supported pixel formats:" in low:
+                    pix_fmts = line.split(":", 1)[1].strip().split()
+                elif "profile" in low and any(x in low for x in ["main", "rext", "main10"]):
+                    parts = line.strip().split()
+                    if parts: profiles.append(parts[0])
+        rows.append({"encoder_name": enc, "available": available,
+                     "supported_profiles": ";".join(sorted(set(profiles))),
+                     "supported_pixel_formats": ";".join(pix_fmts),
+                     "probe_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    return rows
+
+def _cap_supports(cap_row, bit_depth, chroma):
+    fmts = str(cap_row.get("supported_pixel_formats") or "").split(";")
+    for fmt in fmts:
+        bd, cs = PIX_FMT_CAPS.get(fmt, (None, None))
+        if bd == bit_depth and cs == chroma:
+            return True
+    return not fmts
+
+def _format_bit_depth(s):
+    try: return int(str(s).replace("bit", ""))
+    except Exception: return None
+
+def _print_task_commands(tasks):
+    print("\nFFmpeg commands to be executed:")
+    for i, t in enumerate(tasks, 1):
+        print(f"[{i}/{len(tasks)}] {t['src']} -> {t['dst']}")
+        print("  " + " ".join(shlex.quote(x) for x in t["ffmpeg_cmd"]))
+        if t.get("actual_output_format"):
+            print(f"  output-format: {t['actual_output_format']}")
+
+def _summarize_params(tasks):
+    print("\nActual parameter summary:")
+    for t in tasks:
+        print(f"- {Path(t['dst']).name}: encoder={t.get('encoder')} codec={t.get('codec')} output_format={t.get('actual_output_format','default/auto')}")
 
 def _parse_fps(s):
     if not s: return 0.0
@@ -280,11 +373,7 @@ def _resolve_hw_decode_args(encoder: str, src_codec: str):
             "vp9": "vp9_cuvid",
             "av1": "av1_cuvid",
         }
-        args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        dec = nvdec_map.get(src_codec)
-        if dec:
-            args += ["-c:v", dec]
-        return args
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
     if encoder == "qsv":
         qsv_map = {
             "h264": "h264_qsv",
@@ -295,14 +384,9 @@ def _resolve_hw_decode_args(encoder: str, src_codec: str):
             "vp9": "vp9_qsv",
             "av1": "av1_qsv",
         }
-        args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
-        dec = qsv_map.get(src_codec)
-        if dec:
-            args += ["-c:v", dec]
-        return args
+        return ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
     if encoder == "amf":
-        # FFmpeg 没有通用的 *_amf 解码器，AMD 通常走 D3D11VA 硬解路径
-        return ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+        return []
     return []
 
 
@@ -551,7 +635,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
     elif _scale_requested(opts.get("scale")):
         need_sw_decode_for_scale = not bool(hw_scale_vf)
 
-    decode_args = [] if need_sw_decode_for_scale else _resolve_hw_decode_args(opts.get("encoder"), src_codec)
+    decode_args = [] if (need_sw_decode_for_scale or opts.get("force_cpu_decode")) else _resolve_hw_decode_args(opts.get("encoder"), src_codec)
     base = ["ffmpeg","-y","-hide_banner","-loglevel","info", *decode_args, "-i", str(input_path)]
     copy_meta_args = _stream_copy_and_metadata_args(input_path, output_path)
     if custom_params:
@@ -571,54 +655,21 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             pass
         else:
             cmd += ["-vf", f"scale={scale}"]
-    # video encoder
+    # video encoder: validated HEVC templates are centralized in ENCODER_PARAM_TEMPLATES.
     codec = opts.get("codec","hevc")
-    enc = _resolve_video_encoder(opts.get("encoder"), codec)
-    cmd += ["-c:v", enc]
-    if opts.get("preset"): cmd += ["-preset", str(opts.get("preset"))]
-    # rc
-    rc = opts.get("rc_mode","vbr"); br_min=opts.get("br_min"); br_max=opts.get("br_max"); cqp=opts.get("cqp")
-    if "nvenc" in enc:
-        # NVENC fixed policy:
-        # -c:v hevc_nvenc -profile:v rext -preset p7 -tune uhq
-        # -rc vbr -cq 18 -b:v 0 -spatial_aq 1 -aq-strength 12 -temporal_aq 1
-        # -rc-lookahead 64 -lookahead_level auto
-        # -bf 4 -b_ref_mode middle -multipass fullres
-        # -g 240 -keyint_min 24
-        cmd += [
-            "-profile:v", "rext",
-            "-preset", "p7",
-            "-tune", "uhq",
-            "-rc", "vbr",
-            "-cq", "18",
-            "-spatial_aq", "1",
-            "-aq-strength", "12",
-            "-temporal_aq", "1",
-            "-rc-lookahead", "64",
-            "-lookahead_level", "auto",
-            "-bf", "4",
-            "-b_ref_mode", "middle",
-            "-multipass", "fullres",
-            "-g", "240",
-            "-keyint_min", "24",
-        ]
-    elif "qsv" in enc:
-        if rc=="vbr":
-            if br_min: cmd += ["-rc","vbr","-b:v", human_bitrate(br_min)]
-            if br_max: cmd += ["-maxrate", human_bitrate(br_max), "-bufsize", human_bitrate(br_max*2)]
-        elif rc=="cqp" and cqp is not None:
-            cmd += ["-rc","constqp","-qp", str(cqp)]
-        elif rc=="icq" and cqp is not None:
-            cmd += ["-global_quality", str(cqp)]
-    elif "amf" in enc:
-        if rc=="vbr":
-            if br_min: cmd += ["-rc","vbr","-b:v", human_bitrate(br_min)]
-            if br_max: cmd += ["-maxrate", human_bitrate(br_max), "-bufsize", human_bitrate(br_max*2)]
-        elif rc=="cqp" and cqp is not None:
-            cmd += ["-rc","constqp","-qp", str(cqp)]
+    enc_backend = opts.get("encoder")
+    enc = _resolve_video_encoder(enc_backend, codec)
+    if codec == "hevc" and enc_backend == "nvenc":
+        cmd += ENCODER_PARAM_TEMPLATES["nvenc"]
+    elif codec == "hevc" and enc_backend == "qsv":
+        cmd += ENCODER_PARAM_TEMPLATES["qsv"]
+    elif codec == "hevc" and enc_backend == "amf":
+        in_depth = opts.get("input_bit_depth")
+        cmd += ENCODER_PARAM_TEMPLATES["amf_10bit" if in_depth == 10 else "amf_8bit"]
     else:
+        cmd += ["-c:v", enc]
+        rc = opts.get("rc_mode","vbr"); br_min=opts.get("br_min"); br_max=opts.get("br_max"); cqp=opts.get("cqp")
         if rc=="cqp" and cqp is not None:
-            # software encoders prefer CRF semantics over fixed QP for practical VOD use
             cmd += ["-crf", str(cqp)]
             if br_max:
                 cmd += ["-maxrate", human_bitrate(br_max), "-bufsize", human_bitrate(br_max*2)]
@@ -631,7 +682,8 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path, opts: dict, custom_par
             opts.get("encoder"),
             manual_override=manual_quality_override,
         )
-    cmd += _forced_quality_args(opts.get("encoder"), manual_override=manual_quality_override)
+    if not (opts.get("codec") == "hevc" and opts.get("encoder") in {"nvenc", "qsv", "amf"}):
+        cmd += _forced_quality_args(opts.get("encoder"), manual_override=manual_quality_override)
     cmd += [str(output_path)]
     return cmd
 
@@ -1037,7 +1089,7 @@ EXAMPLES:
     parser.add_argument("--skip-res", action="store_true", help="skip 时忽略分辨率交互/修改")
     parser.add_argument("--skip-encfmt", action="store_true", help="skip 时忽略编码格式（hevc/h264）交互/修改")
     parser.add_argument("--skip-hwaccel", action="store_true", help="skip 时忽略硬件加速器选择（nvenc/qsv/amf）交互/修改")
-    parser.add_argument("--skip-builtin-checks", action="store_true", help="跳过部分内建检查（用于非交互/CI）")
+    parser.add_argument("--skip-builtin-checks", "--skip-check", action="store_true", help="跳过执行前确认与严格输出兼容性终止；仍打印参数，并启用输出格式降级 fallback。")
     parser.add_argument("--show-groups-only", action="store_true", help="仅显示分组与 preflight CSV，然后退出")
     parser.add_argument("--flat-output", action="store_true", help="所有输出放在同一目标目录（不保留原始目录结构）；若冲突自动在文件名加源目录名后缀")
     parser.add_argument("--out-suffix", default="", help="输出文件名后缀（例如 _comp 或 deliver；未以下划线开头时会自动补 _）。")
@@ -1096,6 +1148,8 @@ EXAMPLES:
     audio_verify_csv = work_root.joinpath("audio_verify.csv")
     tasks_json = work_root.joinpath("tasks_preflight.json")
     result_csv = work_root.joinpath("tasks_result.csv")
+    input_probe_csv = work_root.joinpath("input_probe.csv")
+    encoder_caps_csv = work_root.joinpath("encoder_capabilities.csv")
 
     # if query requested plus src/work provided, do query as well
     if args.query_params:
@@ -1119,6 +1173,10 @@ EXAMPLES:
 
     def make_task(srcp: Path, outp: Path, group_id, opts: dict, custom_params=None, encoder_label=None, ffmpeg_cmds=None, src_duration_sec=None):
         opts_local = dict(opts or {})
+        probe_row = input_probe_map.get(str(srcp), {})
+        opts_local["input_bit_depth"] = _format_bit_depth(probe_row.get("bit_depth"))
+        opts_local["input_chroma_subsampling"] = probe_row.get("chroma_subsampling")
+        actual_output_format = "default/auto"
         enc_name = str(opts_local.get("encoder", "")).lower()
         manual_quality_override = (
             (enc_name == "nvenc" and args.nvenc_qual is not None) or
@@ -1127,7 +1185,23 @@ EXAMPLES:
         )
         if manual_quality_override:
             opts_local["manual_quality_override"] = True
+        if not custom_params and enc_name in {"nvenc", "qsv", "amf"}:
+            cap = encoder_cap_map.get(_resolve_video_encoder(enc_name, opts_local.get("codec", "hevc")), {})
+            bd = opts_local.get("input_bit_depth")
+            chroma = opts_local.get("input_chroma_subsampling")
+            if cap and not _cap_supports(cap, bd, chroma):
+                print(f"WARNING: input {bd}bit {chroma} may not be supported by hardware decode/encode capability table; removing -hwaccel and using CPU software decode for {srcp}")
+                opts_local["force_cpu_decode"] = True
+            if args.skip_builtin_checks and bd == 10:
+                opts_local["fallback_pix_fmt"] = "p010le"
+                actual_output_format = "10bit 4:2:0 (p010le fallback candidate)"
+            elif args.skip_builtin_checks:
+                opts_local["fallback_pix_fmt"] = "yuv420p"
+                actual_output_format = "8bit 4:2:0 (yuv420p fallback candidate)"
         cmd = build_ffmpeg_cmd(srcp, outp, opts_local, custom_params=custom_params)
+        if opts_local.get("fallback_pix_fmt") and "-pix_fmt" not in cmd:
+            cmd = cmd[:-1] + ["-pix_fmt", opts_local["fallback_pix_fmt"]] + cmd[-1:]
+            print(f"WARNING: --skip-check enabled; output fallback format for {srcp} -> {opts_local['fallback_pix_fmt']}")
         task = {
             "src": str(srcp),
             "dst": str(outp),
@@ -1143,6 +1217,7 @@ EXAMPLES:
             "custom_params": custom_params,
             "ffmpeg_cmd": cmd,
             "src_duration_sec": src_duration_sec,
+            "actual_output_format": actual_output_format,
         }
         if ffmpeg_cmds:
             task["ffmpeg_cmds"] = ffmpeg_cmds
@@ -1163,9 +1238,15 @@ EXAMPLES:
         print("No files found. Exiting."); sys.exit(0)
     print(f"Found {len(files)} input files. Probing media info...")
     entries, groups = group_by_res_fps(files)
+    input_probe_rows = [probe_input_format(Path(f)) for f in files]
+    input_probe_map = {r["file_path"]: r for r in input_probe_rows}
+    encoder_cap_rows = probe_encoder_capabilities()
+    encoder_cap_map = {r["encoder_name"]: r for r in encoder_cap_rows}
+    write_csv(input_probe_csv, ["file_path","bit_depth","chroma_subsampling","pixel_format","probe_time"], input_probe_rows)
+    write_csv(encoder_caps_csv, ["encoder_name","available","supported_profiles","supported_pixel_formats","probe_time"], encoder_cap_rows)
     src_duration_map = {str(e.get("path")): _safe_float(e.get("duration")) for e in entries}
     force_mov_map = {str(Path(e.get("path"))): _should_force_mov_output(Path(e.get("path"))) for e in entries}
-    write_csv(preflight_csv, ["path","width","height","fps","codec","duration","bitrate"], entries)
+    write_csv(preflight_csv, ["path","width","height","fps","codec","duration","bitrate","bit_depth","chroma_subsampling","probe_time"], [{**e, **{"bit_depth": input_probe_map.get(str(Path(e["path"])),{}).get("bit_depth",""), "chroma_subsampling": input_probe_map.get(str(Path(e["path"])),{}).get("chroma_subsampling",""), "probe_time": input_probe_map.get(str(Path(e["path"])),{}).get("probe_time","")}} for e in entries])
     # write groups summary
     grp_rows = []
     for g in groups:
@@ -1264,15 +1345,16 @@ EXAMPLES:
                 outp = _resolve_output_conflict(outp, srcp)
                 tasks.append(make_task(srcp, outp, g["group_id"], cfg, src_duration_sec=src_duration_map.get(str(srcp))))
 
+    _print_task_commands(tasks)
+    if not args.skip_builtin_checks:
+        c = input("Confirm FFmpeg commands and proceed? (y/N): ").strip().lower()
+        if c != "y":
+            print("Aborted"); sys.exit(0)
+
     # write preflight tasks
     with tasks_json.open("w", encoding='utf-8') as jf:
         json.dump(tasks, jf, indent=2, ensure_ascii=False)
     print(f"Tasks preflight saved to: {tasks_json}  (total: {len(tasks)})")
-    # confirm if not skip
-    if not args.skip:
-        c = input("Proceed to execute tasks now? (y/N): ").strip().lower()
-        if c != "y":
-            print("Aborted"); sys.exit(0)
     # determine logs root
     if is_single_file:
         logs_dir = src.parent.joinpath(f"{src.stem}_logs")
@@ -1284,6 +1366,7 @@ EXAMPLES:
     logs_dir.mkdir(parents=True, exist_ok=True)
     # execute
     failed_tasks = execute_tasks(tasks, args.concurrency, work_root, result_csv, logs_dir, timeout=args.timeout, show_progress=True)
+    _summarize_params(tasks)
     # post media info
     out_entries = []
     for t in tasks:
