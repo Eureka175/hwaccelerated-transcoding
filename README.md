@@ -6,7 +6,7 @@
 
 ## 1. 获取最新版本
 
-从 [GitHub Releases](https://github.com/yourusername/transcode_hw/releases) 下载最新版本：
+从 [GitHub Releases](https://github.com/Eureka175/hwaccelerated-transcoding/releases/) 下载最新版本：
 
 - **Windows 分发包**: `transcode_hw_vX.X.zip`（内含 `transcode_hw_main.exe` + `ffmpeg/` + `README.md`）
 - 解压到任意目录即可使用，无需安装 Python 或 FFmpeg
