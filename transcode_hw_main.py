@@ -6,16 +6,15 @@ transcode_hw_main.py - 硬件转码工具 (nvenc/qsv/amf)
 主要特性摘要：
  - 支持单文件或目录输入（--src 可为文件或目录）。
  - 支持 --query-params 单独查询 ffmpeg encoder 帮助 (可单独运行)。
- - 指定 --use-preset 时默认不做分组并输出到 <src>_comp / <src>_logs（可用 --group 强制分组）。
  - 默认交互；--skip 可跳过交互（并可细化跳过哪些项）。
- - 支持 --flat-output、--out-suffix（可指定为 preset1..preset8，语义化为 preset 描述）。
+ - 支持 --flat-output、--out-suffix 控制输出目录结构和文件名后缀。
  - pre/post media info CSV，per-task log，实时进度输出。
 """
 
 import argparse, csv, json, shlex, shutil, subprocess, sys, threading, time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 
 STOP_EVENT = threading.Event()
 ACTIVE_PROCS_LOCK = threading.Lock()
@@ -28,18 +27,6 @@ DEFAULT_FORCED_QUALITY_POLICY = {
     "amf": {"quality": "quality"},
 }
 FORCED_QUALITY_POLICY = json.loads(json.dumps(DEFAULT_FORCED_QUALITY_POLICY))
-# ---------------- presets ----------------
-PRESETS_INFO = OrderedDict([
-    ("preset1", {"name":"4k_prog_archive_1pass", "desc":"HEVC NVENC@P7, tune uhq, VBR CQ22, main10 p010, multipass+AQ+lookahead"}),
-    ("preset2", {"name":"1080p_prog_rel_1pass", "desc":"HEVC QSV@TU1, 1pass, VBR(6/8), lookahead, aac@320k"}),
-    ("preset3", {"name":"4k_prog_archive_2pass", "desc":"HEVC NVENC@P7, tune uhq, VBR CQ22, multipass fullres, AQ+lookahead"}),
-    ("preset4", {"name":"1080p_prog_rel_2pass", "desc":"HEVC x265 slow, 2pass @6M"}),
-    ("preset5", {"name":"fast_proxy_gen_halfres_avc_5m", "desc":"AVC NVENC(强制P7), tune ll, CBR 5M, half res, aac@128k"}),
-    ("preset6", {"name":"fast_proxy_gen_fullres_avc_5m", "desc":"AVC NVENC(强制P7), tune ll, CBR 5M, full res, profile high"}),
-    ("preset7", {"name":"social_plat_share_halfres", "desc":"HEVC QSV(强制TU1), ICQ 28, lookahead, half res, aac@320k"}),
-    ("preset8", {"name":"social_plat_share_fullres", "desc":"HEVC QSV(强制TU1), ICQ 27, lookahead, full res, aac@320k"}),
-])
-
 # ---------------- helpers ----------------
 def run_cmd_capture(cmd):
     try:
@@ -255,48 +242,6 @@ def _probe_streams(input_path: Path):
         return (json.loads(out) or {}).get("streams", []) or []
     except Exception:
         return []
-
-
-def _probe_primary_audio_info(input_path: Path):
-    cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "a:0",
-        "-show_entries", "stream=codec_name,bit_rate:format=duration",
-        "-of", "json", str(input_path)
-    ]
-    rc, out = run_cmd_capture(cmd)
-    if rc != 0 or not out:
-        return {}
-    try:
-        obj = json.loads(out) or {}
-    except Exception:
-        return {}
-    streams = obj.get("streams") or []
-    stream0 = streams[0] if streams else {}
-    fmt = obj.get("format") or {}
-    return {
-        "codec_name": str(stream0.get("codec_name") or "").lower(),
-        "bit_rate": _safe_float(stream0.get("bit_rate")),
-        "duration": _safe_float(fmt.get("duration")),
-    }
-
-
-def _needs_pcm_safety_reencode(input_path: Path, output_path: Path):
-    """
-    避免超长素材里 PCM 直拷导致音频数据超过 4GiB 触发封装失败。
-    策略：仅对 MOV + PCM 进行检查，估算音频大小超阈值时改为 AAC。
-    """
-    if output_path.suffix.lower() != ".mov":
-        return False
-    info = _probe_primary_audio_info(input_path)
-    codec = info.get("codec_name", "")
-    if not codec.startswith("pcm_"):
-        return False
-    br = info.get("bit_rate")
-    dur = info.get("duration")
-    if not br or not dur:
-        return False
-    estimated_bytes = (br / 8.0) * dur
-    return estimated_bytes >= (4 * 1024 * 1024 * 1024)
 
 
 def _should_force_mov_output(input_path: Path):
@@ -532,7 +477,8 @@ def _probe_audio_stream_brief(path: Path):
 def _audio_stream_hash(path: Path, stream_selector: str):
     cmd = [
         "ffmpeg", "-v", "error", "-i", str(path),
-        "-map", stream_selector, "-c", "copy",
+        "-map", stream_selector, "-vn", "-sn", "-dn",
+        "-c:a", "pcm_s16le",
         "-f", "hash", "-hash", "sha256", "-"
     ]
     rc, out = run_cmd_capture(cmd)
@@ -575,14 +521,14 @@ def compare_audio_streams(src_path: Path, dst_path: Path):
         if src_dur > 0 and dst_dur > 0 and abs(src_dur - dst_dur) > 1.0:
             return False, f"audio-duration-mismatch[{i}] src={src_dur:.3f}s dst={dst_dur:.3f}s"
 
-        # 仅当编码格式一致时做 bitstream hash；对于转码后的有损音频，hash 不可相同。
-        if str(ss.get("codec")) == str(ds.get("codec")):
-            sh = _audio_stream_hash(src_path, f"0:a:{i}")
-            dh = _audio_stream_hash(dst_path, f"0:a:{i}")
-            if not sh or not dh:
-                return False, f"audio-hash-failed[{i}] src_hash={bool(sh)} dst_hash={bool(dh)}"
-            if sh != dh:
-                return False, f"audio-hash-mismatch[{i}]"
+        # Decode both streams to a deterministic PCM hash. This verifies copied audio
+        # across container remuxes without depending on container packet framing.
+        sh = _audio_stream_hash(src_path, f"0:a:{i}")
+        dh = _audio_stream_hash(dst_path, f"0:a:{i}")
+        if not sh or not dh:
+            return False, f"audio-hash-failed[{i}] src_hash={bool(sh)} dst_hash={bool(dh)}"
+        if sh != dh:
+            return False, f"audio-hash-mismatch[{i}]"
 
     return True, "audio-verify-ok"
 
@@ -1044,20 +990,16 @@ def move_failed_sources_to_error(failed_tasks, src_root: Path, error_root: Path)
 
 # ---------------- main ----------------
 def main():
-    preset_epilog = "\nPRESETS:\n"
-    for k,v in PRESETS_INFO.items():
-        preset_epilog += f"  {k}: {v['name']} -> {v['desc']}\n"
-    preset_epilog += "\nQUALITY ORDER (high -> low):\n  x265 slow 2pass > NVENC P7 > QSV TU1 > QSV TU2 > QSV TU3 > NVENC P1\n"
     examples = """
 EXAMPLES:
   Query encoder params only:
     transcode_hw_main.py --query-params nvenc --work ./work
 
-  Single-file quick transcode using preset:
-    transcode_hw_main.py --src ./video.mp4 --use-preset preset1
+  Single-file transcode with explicit output folder:
+    transcode_hw_main.py --src ./video.mp4 --dst ./out --skip
 
-  Directory using preset (default no-group, output to <src>_comp):
-    transcode_hw_main.py --src F:/Movies/Batch --use-preset preset5
+  Directory transcode with explicit output folder:
+    transcode_hw_main.py --src F:/Movies/Batch --dst F:/Out --skip
 
   Directory with grouping and interactive per-group config:
     transcode_hw_main.py --src F:/Movies/Batch --dst F:/Out --work F:/Work --group
@@ -1067,9 +1009,9 @@ EXAMPLES:
 """
     parser = argparse.ArgumentParser(description="transcode_hw_main: hw-accelerated batch transcode (nvenc/qsv/amf). Default: grouping ON. Use --no-group to treat all as 1 group.",
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
-                                     epilog=preset_epilog + examples)
+                                     epilog=examples)
     parser.add_argument("--src", help="源路径（文件或目录）。可为单个文件或目录。若省略且只执行 --query-params，则可不指定。")
-    parser.add_argument("--dst", help="目标根目录（默认：当使用 preset 并且未传 dst 时，自动使用 <src>_comp，单文件输出为 <name>_comp.ext）。")
+    parser.add_argument("--dst", help="目标根目录。未指定时默认输出到源路径同级的 <src>_comp 目录；单文件输出到该目录中。")
     parser.add_argument("--work", help="工作目录（CSV, logs, mediainfo 等）。若只想 query encoder，也可用 --work 指定保存位置。")
     parser.add_argument("--recursive", action="store_true", help="递归遍历子文件夹（默认不递归）")
     parser.add_argument("--extensions", default="mp4,mov", help="要处理的文件扩展名，逗号分隔（例如 mp4,mov）")
@@ -1084,8 +1026,7 @@ EXAMPLES:
     parser.add_argument("--max-br", type=float, default=None, help="默认最大比特率 Mbps（覆盖规则）")
     parser.add_argument("--cqp", type=int, default=None, help="默认 CQP/CQ 值")
     parser.add_argument("--preset", default=None, help="底层编码器 preset（nvenc:p1..p7, qsv:TU1..TU7 等）")
-    parser.add_argument("--use-preset", choices=list(PRESETS_INFO.keys()), default=None, help="使用快速预设（会覆盖其他参数并默认不分组）")
-    parser.add_argument("--group", action="store_true", help="与 --use-preset 一起使用时强制启用分组（默认 use-preset 时不分组）")
+    parser.add_argument("--group", action="store_true", help="兼容旧命令的占位参数；分组默认已启用，使用 --no-group 可关闭。")
     parser.add_argument("--no-group", action="store_true", help="跳过分组（将所有文件视为单组）；默认分组开启。")
     parser.add_argument("--custom-params", default=None, help="自定义 ffmpeg 参数字符串（直接插入到 -i <input> 之后）。不要包含输出文件名。")
     parser.add_argument("--query-params", choices=["nvenc","qsv","amf"], default=None, help="查询 ffmpeg encoder 参数并打印，支持单独运行（只需 --query-params 和 --work）。")
@@ -1099,7 +1040,7 @@ EXAMPLES:
     parser.add_argument("--skip-builtin-checks", action="store_true", help="跳过部分内建检查（用于非交互/CI）")
     parser.add_argument("--show-groups-only", action="store_true", help="仅显示分组与 preflight CSV，然后退出")
     parser.add_argument("--flat-output", action="store_true", help="所有输出放在同一目标目录（不保留原始目录结构）；若冲突自动在文件名加源目录名后缀")
-    parser.add_argument("--out-suffix", default="", help="输出文件名后缀（例如 _comp 或 preset1）。若值为 preset1..preset8，则后缀会被替换为该 preset 的描述文本。")
+    parser.add_argument("--out-suffix", default="", help="输出文件名后缀（例如 _comp 或 deliver；未以下划线开头时会自动补 _）。")
     parser.add_argument("--nvenc-qual", default=None, help="快速手动覆盖 NVENC 质量档（例如 p7/p5）。设置后将覆盖默认强制策略。")
     parser.add_argument("--qsv-qual", default=None, help="快速手动覆盖 QSV TU 档位（例如 tu1/tu3 或 1/3）。设置后将覆盖默认强制策略。")
     parser.add_argument("--amf-qual", default=None, help="快速手动覆盖 AMF quality（例如 quality/balanced/speed）。设置后将覆盖默认强制策略。")
@@ -1129,15 +1070,14 @@ EXAMPLES:
         print("Manual injected command detected (--custom-params): full manual params take precedence.")
 
     # handle query-only case
-    if args.query_params and not args.src and not args.work:
-        # require only work to save file; if not provided, use cwd/work_query
-        work = Path(args.work) if args.work else Path.cwd().joinpath("transcode_hw_main_work")
+    if args.query_params and not args.src:
+        work = Path(args.work).expanduser().resolve() if args.work else Path.cwd().joinpath("transcode_hw_main_work")
         work.mkdir(parents=True, exist_ok=True)
         query_encoder(args.query_params, work)
         print("Query finished. Exiting.")
         sys.exit(0)
 
-    # require src and work at minimum for normal flow
+    # require src for normal flow
     if not args.src:
         print("Error: --src required (or use --query-params only)."); sys.exit(2)
     src = Path(args.src).expanduser().resolve()
@@ -1164,19 +1104,12 @@ EXAMPLES:
 
     # detect single-file vs dir
     is_single_file = src.is_file()
-    # default dst handling when use-preset without dst: auto <src>_comp
+    # default dst handling: write outputs to a sibling <src>_comp folder when --dst is omitted.
     if args.dst:
         dst_root = Path(args.dst).expanduser().resolve()
     else:
-        if args.use_preset:
-            if is_single_file:
-                dst_root = src.parent  # single file -> output sibling (naming handled later)
-            else:
-                dst_root = src.parent.joinpath(f"{src.name}_comp")
-        else:
-            # require dst if not using preset
-            print("Note: --dst not provided. Defaulting work sibling folder for outputs.")
-            dst_root = src.parent.joinpath(f"{src.name}_comp")
+        print("Note: --dst not provided. Defaulting to sibling output folder: <src>_comp.")
+        dst_root = src.parent.joinpath(f"{src.name}_comp")
     dst_root.mkdir(parents=True, exist_ok=True)
 
     # collect filters
@@ -1241,124 +1174,34 @@ EXAMPLES:
     write_csv(pre_media_csv, ["path","width","height","fps","codec","duration","bitrate"], entries)
     print("Preflight and media info written to work folder.")
 
-    # handle out-suffix preset name mapping
+    if args.show_groups_only:
+        print("Groups summary:")
+        for g in groups:
+            print(f"  Group {g['group_id']}: {g['width']}x{g['height']} @ {g['fps']} fps, files={len(g['files'])}")
+        print("Show-groups-only requested. Exiting before task generation.")
+        sys.exit(0)
+
+    # handle output suffix
     out_suffix = args.out_suffix or ""
-    if out_suffix in PRESETS_INFO:
-        out_suffix = "_" + PRESETS_INFO[out_suffix]["name"]
-    elif out_suffix:
-        # normalize to begin with underscore
-        if not out_suffix.startswith("_"): out_suffix = "_" + out_suffix
+    if out_suffix and not out_suffix.startswith("_"):
+        out_suffix = "_" + out_suffix
 
-    # Determine execution mode: preset/custom/interactive
-    chosen_mode = "cli"
-    if args.custom_params and args.use_preset:
-        print("Both --use-preset and --custom-params provided. Choose: [1] preset, [2] custom, [3] cancel")
-        c = input("choice (1/2/3) [3]: ").strip()
-        if c == "1": chosen_mode = "preset"
-        elif c == "2": chosen_mode = "custom"
-        else: print("Cancelled"); sys.exit(0)
-    elif args.custom_params:
-        chosen_mode = "custom"
-    elif args.use_preset:
-        chosen_mode = "preset"
-    else:
-        chosen_mode = "interactive"
+    # Determine execution mode: custom params or interactive/default CLI.
+    chosen_mode = "custom" if args.custom_params else "interactive"
 
-    # if use_preset and not group flag: default no-group
-    grouping_enabled = True
-    if chosen_mode == "preset" and not args.group:
-        grouping_enabled = False
-    if args.no_group:
-        grouping_enabled = False
+    grouping_enabled = not args.no_group
 
     # build tasks
     tasks = []
-    def preset_to_opts(key):
-        if key == "preset1":
-            return {"encoder":"nvenc","codec":"hevc","preset":"p7","rc_mode":"vbr","br_min":30,"br_max":40,
-                    "audio_bitrate":320,"scale":"same",
-                    "extra":"-tune hq -profile:v main10 -pix_fmt p010le -rc vbr_hq -look_ahead 1 -look_ahead_depth 32 -bf 4 -b_ref_mode middle -g 240 -spatial_aq 1 -temporal_aq 1 -aq-strength 9"}
-        if key == "preset2":
-            return {"encoder":"qsv","codec":"hevc","rc_mode":"vbr","br_min":6,"br_max":8,
-                    "audio_bitrate":320,"scale":"same",
-                    "extra":"-tu 1 -look_ahead 1 -look_ahead_depth 30 -bf 3 -g 120 -profile:v main"}
-        if key == "preset3":
-            return {"encoder":"nvenc","codec":"hevc","preset":"p7","rc_mode":"vbr","br_min":30,"br_max":40,
-                    "audio_bitrate":320,"scale":"same",
-                    "extra":"-tune hq -profile:v main10 -pix_fmt p010le -rc vbr_hq -multipass fullres -look_ahead 1 -look_ahead_depth 32 -bf 4 -b_ref_mode middle -g 240"}
-        if key == "preset4":
-            return {"encoder":"cpu","codec":"hevc","preset":"slow","rc_mode":"vbr","br_min":6,"br_max":6,
-                    "audio_bitrate":320,"scale":"same","pass_mode":2}
-        if key == "preset5":
-            return {"encoder":"nvenc","codec":"h264","preset":"p1","rc_mode":"cbr","br_min":5,"br_max":5,
-                    "audio_bitrate":128,"scale":"half",
-                    "extra":"-tune ll -g 60 -bf 2"}
-        if key == "preset6":
-            return {"encoder":"nvenc","codec":"h264","preset":"p1","rc_mode":"cbr","br_min":5,"br_max":5,
-                    "audio_bitrate":128,"scale":"same",
-                    "extra":"-tune ll -profile:v high -level 5.1 -g 60 -bf 2"}
-        if key == "preset7":
-            return {"encoder":"qsv","codec":"hevc","rc_mode":"icq","cqp":28,"audio_bitrate":320,"scale":"half",
-                    "extra":"-tu 3 -look_ahead 1 -look_ahead_depth 30 -bf 3 -g 120"}
-        if key == "preset8":
-            return {"encoder":"qsv","codec":"hevc","rc_mode":"icq","cqp":27,"audio_bitrate":320,"scale":"same",
-                    "extra":"-tu 2 -look_ahead 1 -look_ahead_depth 40 -bf 4 -g 240"}
-        return {}
-
-    def preset4_two_pass_cmds(srcp: Path, outp: Path):
-        passlog = outp.parent.joinpath(outp.stem + ".x265_2pass")
-        null_sink = "NUL" if sys.platform.startswith("win") else "/dev/null"
-        cmd1 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp),
-                "-c:v","libx265","-preset","slow","-b:v","6M","-pass","1",
-                "-x265-params","rc-lookahead=40:aq-mode=3","-passlogfile",str(passlog),
-                "-an","-f","null",null_sink]
-        cmd2 = ["ffmpeg","-y","-hide_banner","-loglevel","info","-i",str(srcp)]
-        cmd2 += _stream_copy_and_metadata_args(srcp, outp)
-        cmd2 += _audio_codec_args_for_output(srcp, outp)
-        cmd2 += _extra_stream_codec_args_for_output(outp)
-        cmd2 += ["-c:v","libx265","-preset","slow","-b:v","6M","-pass","2",
-                "-x265-params","rc-lookahead=60:aq-mode=3:aq-strength=0.9:psy-rd=2.0","-passlogfile",str(passlog),
-                str(outp)]
-        return [cmd1, cmd2]
-
-    if chosen_mode == "preset":
-        opts_map = preset_to_opts(args.use_preset)
-        # if single file: output to same dir with original name/suffix; add _comp on conflict; logs into same-named _logs
-        if is_single_file:
-            outp = src.parent.joinpath(f"{src.stem}{out_suffix}{src.suffix}")
-            outp = _apply_container_policy(src, outp)
-            outp = _resolve_output_conflict(outp, src)
-            log_root = src.parent.joinpath(f"{src.stem}_logs")
-            tasks.append(make_task(src, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(src, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(src))))
-            work_logs_root = log_root
-        else:
-            work_logs_root = dst_root.parent.joinpath(f"{dst_root.name}_logs") if args.dst is None else dst_root.parent.joinpath(f"{dst_root.name}_logs")
-            # if grouping disabled: iterate all files, apply same opts
-            if not grouping_enabled:
-                for f in files:
-                    srcp = Path(f)
-                    outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
-                    outp = _apply_container_policy(srcp, outp)
-                    outp = _resolve_output_conflict(outp, srcp)
-                    tasks.append(make_task(srcp, outp, 0, opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(srcp))))
-            else:
-                # grouping enabled: build per-group tasks but with same preset applied per-file
-                entries_groups = groups
-                for g in entries_groups:
-                    for f in g["files"]:
-                        srcp = Path(f["path"])
-                        outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
-                        outp = _apply_container_policy(srcp, outp)
-                        outp = _resolve_output_conflict(outp, srcp)
-                        tasks.append(make_task(srcp, outp, g["group_id"], opts_map, ffmpeg_cmds=preset4_two_pass_cmds(srcp, outp) if args.use_preset == "preset4" else None, src_duration_sec=src_duration_map.get(str(srcp))))
-    elif chosen_mode == "custom":
+    if chosen_mode == "custom":
         if not args.custom_params:
             print("custom mode selected but no --custom-params given. Exiting."); sys.exit(2)
         # single file or many: apply custom params directly
         for f in files:
             srcp = Path(f)
             if is_single_file:
-                outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}{srcp.suffix}")
+                outp = dst_root.joinpath(f"{srcp.stem}{out_suffix}{_default_output_suffix_for_source(srcp)}")
+                outp.parent.mkdir(parents=True, exist_ok=True)
             else:
                 outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
             outp = _apply_container_policy(srcp, outp)
@@ -1413,7 +1256,8 @@ EXAMPLES:
             for f in g["files"]:
                 srcp = Path(f["path"])
                 if is_single_file:
-                    outp = srcp.parent.joinpath(f"{srcp.stem}{out_suffix}{srcp.suffix}")
+                    outp = dst_root.joinpath(f"{srcp.stem}{out_suffix}{_default_output_suffix_for_source(srcp)}")
+                    outp.parent.mkdir(parents=True, exist_ok=True)
                 else:
                     outp = make_output_path(srcp, src, dst_root, flat_output=args.flat_output, out_suffix=out_suffix)
                 outp = _apply_container_policy(srcp, outp)
@@ -1425,7 +1269,7 @@ EXAMPLES:
         json.dump(tasks, jf, indent=2, ensure_ascii=False)
     print(f"Tasks preflight saved to: {tasks_json}  (total: {len(tasks)})")
     # confirm if not skip
-    if not args.skip and chosen_mode != "preset":
+    if not args.skip:
         c = input("Proceed to execute tasks now? (y/N): ").strip().lower()
         if c != "y":
             print("Aborted"); sys.exit(0)
