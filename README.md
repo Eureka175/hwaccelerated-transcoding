@@ -1,400 +1,201 @@
 # hwaccelerated-transcoding
 
-一个面向素材批处理场景的 **FFmpeg 硬件转码脚本**，支持 `NVENC / QSV / AMF`，并提供：
+一个面向素材批处理场景的 **FFmpeg 硬件转码脚本**。主脚本为 `transcode_hw_main.py`，支持 `NVENC / QSV / AMF` 硬件编码、自定义 FFmpeg 参数、分组批处理、失败回退和音频校验。
 
-- 单文件与目录批量转码
-- 按分辨率 + 帧率自动分组（可关闭）
-- 交互式配置、非交互 `--skip`、预设模式、自定义参数模式
-- 并发执行、超时控制、失败自动回退 CPU
-- 前后媒体信息、任务结果、分组摘要、逐任务日志的完整追踪
+## 1. 当前能力
 
-主脚本：`transcode_hw_main.py`。
-
----
-
-## 1. 功能概览
-
-### 1.1 输入与筛选
-- `--src` 支持：
-  - 单个视频文件
-  - 目录批处理
-- 目录模式可配置：
-  - `--recursive`：递归子目录
-  - `--extensions`：扩展名白名单（默认常见视频格式）
-  - `--prefixes` / `--suffixes`：文件名前后缀白名单
-  - `--invert-prefix` / `--invert-suffix`：对白名单反选
-
-### 1.2 执行模式
-程序支持 3 类执行路径：
-1. **Preset 模式**：`--use-preset preset1..preset8`，适合快速落地。
-2. **Custom 模式**：`--custom-params "..."`，直接把参数注入 ffmpeg 命令。
-3. **Interactive/CLI 模式**：按分组交互配置，或结合 `--skip` 非交互执行。
-
-### 1.3 分组策略
-- 默认按 `width / height / fps` 自动分组。
-- `--no-group` 可关闭分组，把所有输入视为一组。
-- 与 `--use-preset` 联用时默认不分组；可用 `--group` 强制分组。
-
-### 1.4 结果可追踪性
-每次任务会生成结构化产物，便于审计、回溯、排障：
-- `preflight_files.csv`：输入探测信息
-- `groups_summary.csv`：分组汇总
-- `tasks_preflight.json`：执行前任务清单（含命令）
-- `tasks_result.csv`：任务执行结果
-- `pre_media_info.csv` / `post_media_info.csv`：转码前后媒体信息
-- `*_logs/*.log`：每个任务独立日志
-
-
-### 1.5 强制质量策略（默认启用，可手动覆盖）
-无论你在命令行、交互模式、预设模式里如何设置，脚本都会在最终 ffmpeg 命令层面强制：
-- NVENC：`-preset p7`
-- QSV：`-tu 1`
-- AMF：`-quality quality`（AMF 最高质量档）
-
-可用快速覆盖参数手动改写该策略：
-- `--nvenc-qual p7`（示例：`p1..p7`）
-- `--qsv-qual tu1`（也支持 `--qsv-qual 1`）
-- `--amf-qual quality`（例如 `quality/balanced/speed`）
-
-如果使用 `--custom-params` 手动注入 ffmpeg 参数，则该任务完全以手动参数为准。
-
-另外：
-- 默认仅压缩主视频流（`0:v:0`），避免 attached pic 等附加视频流触发误重编码。
-- 默认保留全部输入元数据与章节（含常见运动相机型号信息）。流保留按容器能力处理：MOV 尽量保留数据/附件流；MP4 会在保证可封装前提下尽量保留安全的数据流（如 timecode/tmcd），并规避会导致封装失败的私有 data track。
-- 输出默认保持原始文件名和后缀；仅在目标冲突时自动追加 `_comp`（如 `A.mp4 -> A_comp.mp4`）。
-- 若 `ffprobe` 发现 metadata/data/附件等扩展流（如 `djmd/dbgi/tmcd`），该文件自动改为输出 `MOV`，以规避 MP4 容器兼容问题。
-- 音频策略：`MP4 -> AAC 320k`（不强制 `-ac`，保留原始声道布局）；`MOV` 默认 `audio copy`，但若检测到超长素材导致 `PCM` 估算将超过 `4GiB`，会自动转 `AAC 320k` 以避免封装失败。
-
----
+- 支持单文件或目录输入。
+- 目录模式支持递归扫描、扩展名过滤、文件名前缀/后缀过滤与反选。
+- 默认按 `width / height / fps` 分组；`--no-group` 可把所有输入视为一组。
+- 支持交互配置，也支持 `--skip --skip-builtin-checks` 非交互执行。
+- 支持 `--custom-params` 直接注入 FFmpeg 参数。
+- 默认只重编码主视频流，音频流单独抽取后以 `copy` 方式混回输出文件。
+- 硬件编码失败时会自动尝试一次 CPU 回退。
+- 生成 preflight、分组、任务结果、转码前后媒体信息、音频校验和逐任务日志。
 
 ## 2. 环境要求
 
-### 2.1 必备组件
 - Python 3.8+
-- FFmpeg（含目标硬件编码器）
-- FFprobe（通常随 FFmpeg 安装）
+- FFmpeg
+- FFprobe
+- 目标硬件编码器对应的驱动、运行时和设备权限
 
-### 2.2 快速自检
+快速自检：
+
 ```bash
 python3 --version
 ffmpeg -version
 ffprobe -version
-```
-
-### 2.3 硬件编码能力检查
-```bash
 ffmpeg -encoders | rg -E "(h264_nvenc|hevc_nvenc|h264_qsv|hevc_qsv|h264_amf|hevc_amf)"
 ```
 
-如果本机没有 `rg`：
-```bash
-ffmpeg -encoders
-```
-然后手动搜索 `nvenc/qsv/amf`。
+没有 `rg` 时可直接运行 `ffmpeg -encoders` 后手动搜索 `nvenc/qsv/amf`。
 
----
+## 3. 输出与工作目录
 
-## 3. 快速开始（扩展版）
+- `--src`：输入文件或输入目录。
+- `--dst`：输出目录；省略时会在源路径同级创建 `<src>_comp`。
+- `--work`：工作目录；省略时会在源路径同级创建 `<src>_work`。
+- 单文件模式也会输出到 `--dst` 指定目录；没有 `--dst` 时输出到 `<src>_comp`。
+- 默认保持输入文件名；目标冲突或目标等于源文件时自动追加 `_comp`、`_comp2` 等后缀。
+- `--out-suffix` 可追加输出文件名后缀，例如 `--out-suffix deliver` 会生成 `_deliver` 后缀。
+- `--flat-output` 可把目录批处理结果平铺到同一个输出目录。
 
-> 下面命令均可直接复制，按你的路径替换即可。
+## 4. 典型用法
 
-### 3.1 仅查询编码器参数（不执行转码）
+### 4.1 查询编码器参数
+
 ```bash
 python3 transcode_hw_main.py --query-params nvenc --work ./work
-python3 transcode_hw_main.py --query-params qsv   --work ./work
-python3 transcode_hw_main.py --query-params amf   --work ./work
+python3 transcode_hw_main.py --query-params qsv --work ./work
+python3 transcode_hw_main.py --query-params amf --work ./work
 ```
-用途：先确认当前环境下编码器参数/能力，再决定具体策略。
 
-### 3.2 单文件快速转码（最省心）
-```bash
-python3 transcode_hw_main.py --src ./video.mp4 --use-preset preset1
-```
-特点：
-- 自动生成输出名（`*_comp`）
-- 自动生成日志目录与工作工件
+### 4.2 单文件非交互转码
 
-### 3.3 目录批量 + 预设（自动输出到 `<src>_comp`）
-```bash
-python3 transcode_hw_main.py --src ./materials --use-preset preset5
-```
-适合：代理文件快速批量生成。
-
-### 3.4 目录批量 + 指定输出目录 + 非交互
 ```bash
 python3 transcode_hw_main.py \
-  --src ./materials \
-  --dst ./out \
-  --work ./work \
-  --skip
-```
-特点：
-- 不再交互询问，直接按规则执行
-- 工作工件集中到 `./work`
-
-### 3.5 目录批量 + 分组执行
-```bash
-python3 transcode_hw_main.py \
-  --src ./materials \
-  --dst ./out \
-  --work ./work \
-  --group
-```
-特点：
-- 按分辨率/帧率分组
-- 每组可独立配置参数
-
-### 3.6 先看分组，不执行
-```bash
-python3 transcode_hw_main.py \
-  --src ./materials \
-  --work ./work \
-  --show-groups-only
-```
-适合：先检查素材结构和建议配置是否符合预期。
-
----
-
-## 4. 命令示例
-
-### 4.1 单文件：高质量归档（NVENC HEVC）
-```bash
-python3 transcode_hw_main.py --src ./a.mov --use-preset preset1
-```
-
-### 4.2 单文件：社媒分享（QSV HEVC）
-```bash
-python3 transcode_hw_main.py --src ./a.mov --use-preset preset8
-```
-
-### 4.3 目录：代理文件半分辨率批量生成
-```bash
-python3 transcode_hw_main.py --src ./rushes --use-preset preset5
-```
-
-### 4.4 目录：代理文件全分辨率批量生成
-```bash
-python3 transcode_hw_main.py --src ./rushes --use-preset preset6
-```
-
-### 4.5 目录：强制递归 + 扩展名筛选
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --recursive \
-  --extensions mp4,mov,mxf \
-  --dst ./out \
-  --skip
-```
-
-### 4.6 目录：仅处理指定前缀文件
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --prefixes DJI,SONY \
-  --dst ./out \
-  --skip
-```
-
-### 4.7 目录：排除指定后缀（反选）
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --suffixes _proxy,_tmp \
-  --invert-suffix \
-  --dst ./out \
-  --skip
-```
-
-### 4.8 不分组：所有文件按统一参数
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --dst ./out \
-  --no-group \
-  --encoder nvenc \
-  --codec hevc \
-  --rc-mode vbr \
-  --min-br 10 \
-  --max-br 16 \
-  --skip
-```
-
-### 4.9 分组 + 并发执行 + 超时控制
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --dst ./out \
-  --work ./work \
-  --group \
-  --concurrency 2 \
-  --timeout 3600 \
-  --skip
-```
-
-### 4.10 平铺输出（不保留目录树）
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --dst ./out_flat \
-  --flat-output \
-  --skip
-```
-
-### 4.11 自定义输出后缀
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --dst ./out \
-  --out-suffix _deliver \
-  --skip
-```
-
-### 4.12 用 preset 名作为语义化后缀
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --dst ./out \
-  --out-suffix preset1 \
-  --use-preset preset1
-```
-
-### 4.13 指定 AMF 编码
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --dst ./out \
-  --encoder amf \
-  --codec h264 \
-  --rc-mode vbr \
-  --min-br 8 \
-  --max-br 12 \
-  --skip
-```
-
-### 4.14 使用自定义 ffmpeg 参数
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --dst ./out \
-  --custom-params "-c:v libx264 -preset slow -crf 20 -c:a aac -b:a 192k" \
-  --skip
-```
-> 注意：`--custom-params` 中不要包含输出文件名。
-
-### 4.15 预设与自定义参数二选一（交互确认）
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
-  --use-preset preset3 \
-  --custom-params "-c:v libx265 -crf 22"
-```
-运行后程序会提示选择 preset / custom / cancel。
-
-### 4.16 单文件 + 指定工作目录（便于定位日志）
-```bash
-python3 transcode_hw_main.py \
-  --src ./clip.mp4 \
-  --work ./clip_work \
-  --use-preset preset2
-```
-
-### 4.17 目录 + 跳过内建确认（CI/自动化场景）
-```bash
-python3 transcode_hw_main.py \
-  --src ./media \
+  --src ./video.mp4 \
   --dst ./out \
   --work ./work \
   --skip \
   --skip-builtin-checks
 ```
 
+### 4.3 目录批量非交互转码
 
----
-
-## 5. 常用参数说明
-
-### 5.1 路径与输入
-- `--src`：输入路径（文件或目录）。
-- `--dst`：输出根目录。目录模式下建议显式指定，便于资产管理。
-- `--work`：工作目录。所有 preflight、CSV、JSON、查询文本等工件集中放置。
-
-### 5.2 扫描与筛选
-- `--recursive`：目录递归扫描。
-- `--extensions`：扩展名白名单，如 `mp4,mov,mxf`。
-- `--prefixes`：仅处理文件名以这些前缀开头的文件。
-- `--suffixes`：仅处理文件名以这些后缀结尾（不含扩展名）的文件。
-- `--invert-prefix` / `--invert-suffix`：把“命中白名单”改为“排除命中项”。
-
-### 5.3 编码参数
-- `--encoder {nvenc,qsv,amf}`：硬件编码器后端。
-- `--codec {hevc,h264}`：视频编码格式。
-- `--rc-mode {vbr,cbr,cqp,icq}`：码控方式。
-- `--min-br/--max-br`：VBR/CBR 比特率范围（Mbps）。
-- `--cqp`：质量量化参数（CQP/ICQ 场景）。
-- `--preset`：传递给底层编码器的 preset（如 NVENC `p1..p7`，QSV `TU1..TU7`）。
-
-### 5.4 模式控制
-- `--use-preset`：启用内置预设（preset1..preset8）。
-- `--custom-params`：直接注入 ffmpeg 参数（高级用法）。
-- `--group`：在 preset 模式下强制启用分组。
-- `--no-group`：关闭分组，所有文件按一套策略处理。
-- `--skip`：非交互执行，适合批处理/自动化。
-
-### 5.5 性能与稳定性
-- `--concurrency`：并发进程数（建议从 1~2 起测）。
-- `--timeout`：单任务超时秒数，防止异常卡死。
-- `--skip-builtin-checks`：跳过部分内建确认（CI场景常用）。
-
-### 5.6 输出组织
-- `--flat-output`：所有输出平铺在同一目录；同名冲突时自动加后缀。
-- `--out-suffix`：输出文件名后缀（自动补 `_`）。
-  - 若填 `preset1..preset8`，会映射为预设语义化名称。
-
-### 5.7 查询能力
-- `--query-params {nvenc,qsv,amf}`：打印并保存 ffmpeg 编码器帮助信息。
-- 可单独执行查询，不必携带完整转码参数。
-
----
-
-## 6. 内置预设
-
-| ID | 名称 | 说明 |
-|---|---|---|
-| preset1 | 4k_prog_archive_1pass | HEVC NVENC@P7，1pass，vbr_hq(30/40)，main10 p010 |
-| preset2 | 1080p_prog_rel_1pass | HEVC QSV@TU1，1pass，VBR(6/8)，aac@320k |
-| preset3 | 4k_prog_archive_2pass | HEVC NVENC@P7，multipass fullres，vbr_hq(30/40) |
-| preset4 | 1080p_prog_rel_2pass | HEVC x265 slow，2pass @6M（CPU） |
-| preset5 | fast_proxy_gen_halfres_avc_5m | AVC NVENC@P1，CBR 5M，half res，aac@128k |
-| preset6 | fast_proxy_gen_fullres_avc_5m | AVC NVENC@P1，CBR 5M，full res，profile high |
-| preset7 | social_plat_share_halfres | HEVC QSV@TU3，ICQ 28，half res |
-| preset8 | social_plat_share_fullres | HEVC QSV@TU2，ICQ 27，full res |
-
----
-
-## 7. 故障排查
-
-### 7.1 ffmpeg/ffprobe 未找到
 ```bash
-ffmpeg -version
-ffprobe -version
+python3 transcode_hw_main.py \
+  --src ./materials \
+  --dst ./out \
+  --work ./work \
+  --skip \
+  --skip-builtin-checks
 ```
-确保二者已安装并在 `PATH` 中。
 
-### 7.2 硬件编码器不可用
-- 先执行：
-  ```bash
-  python3 transcode_hw_main.py --query-params nvenc --work ./work
-  ```
-  或替换为 `qsv/amf`。
-- 检查 GPU 驱动、系统权限、容器环境映射。
-- 若硬件失败，脚本会自动尝试一次 CPU 回退。
+### 4.4 关闭分组，所有文件使用同一套参数
 
-### 7.3 批量任务慢或失败多
-- 将 `--concurrency` 调低到 1 或 2 再观察。
-- 使用 `--timeout` 限制异常卡死任务。
-- 重点看：`tasks_result.csv` + 对应任务日志。
+```bash
+python3 transcode_hw_main.py \
+  --src ./materials \
+  --dst ./out \
+  --work ./work \
+  --no-group \
+  --encoder nvenc \
+  --codec hevc \
+  --skip \
+  --skip-builtin-checks
+```
 
-### 7.4 输出文件名冲突
-- 平铺输出时同名冲突会自动重命名；
-- 可配合 `--out-suffix` 让命名更可控。
+### 4.5 递归扫描并筛选扩展名
+
+```bash
+python3 transcode_hw_main.py \
+  --src ./media \
+  --recursive \
+  --extensions mp4,mov,mxf \
+  --dst ./out \
+  --work ./work \
+  --skip \
+  --skip-builtin-checks
+```
+
+### 4.6 使用自定义 FFmpeg 参数
+
+```bash
+python3 transcode_hw_main.py \
+  --src ./media \
+  --dst ./out \
+  --work ./work \
+  --custom-params "-c:v libx264 -crf 20 -c:a aac -b:a 192k" \
+  --skip
+```
+
+`--custom-params` 不要包含输出文件名。该模式会按用户提供的参数执行，不套用脚本内置的视频编码、音频 copy、强制质量等策略。
+
+### 4.7 只生成分组和媒体探测信息
+
+```bash
+python3 transcode_hw_main.py \
+  --src ./media \
+  --work ./work \
+  --show-groups-only
+```
+
+## 5. 关键参数
+
+### 5.1 输入筛选
+
+- `--recursive`：递归处理子目录。
+- `--extensions`：扩展名白名单，默认 `mp4,mov`。
+- `--prefixes` / `--suffixes`：文件名前缀/后缀白名单。
+- `--invert-prefix` / `--invert-suffix`：排除命中白名单的文件。
+
+### 5.2 编码参数
+
+- `--encoder {nvenc,qsv,amf}`：硬件编码后端，默认 `nvenc`。
+- `--codec {hevc,h264}`：视频编码格式，默认 `hevc`。
+- `--rc-mode {vbr,cbr,cqp,icq}`：码控方式；非交互默认使用 `cqp`。
+- `--min-br` / `--max-br`：VBR/CBR 码率参数，单位 Mbps。
+- `--cqp`：CQP/ICQ 质量值。
+- `--preset`：传给底层编码器的 FFmpeg 参数；NVENC 最终仍会受到默认强制质量策略影响，除非使用 `--nvenc-qual` 手动覆盖。
+
+### 5.3 强制质量策略
+
+普通模式下脚本会在最终命令中加入以下硬件编码质量参数：
+
+- NVENC：`-preset p7`
+- QSV：`-tu 1`
+- AMF：`-quality quality`
+
+可用以下参数改写：
+
+- `--nvenc-qual p7`
+- `--qsv-qual tu1` 或 `--qsv-qual 1`
+- `--amf-qual quality`
+
+`--custom-params` 模式不应用这些自动策略。
+
+### 5.4 执行控制
+
+- `--skip`：跳过交互配置。
+- `--skip-builtin-checks`：跳过执行前确认，适合 CI 或无人值守任务。
+- `--concurrency`：并发 FFmpeg 进程数。
+- `--timeout`：单任务超时秒数。
+- `--show-groups-only`：写出探测和分组文件后退出。
+
+## 6. 音频、元数据与容器策略
+
+普通模式下脚本会优先保护源音频：
+
+1. 源文件有音频时，先把音频流抽取到临时 `.mka`，编码视频，再把视频和音频以 `-c:a copy` 混回输出。
+2. 源文件无音频时跳过音频抽取步骤，只执行视频转码。
+3. 任务完成后先校验音频流数量；全部任务结束后写出 `audio_verify.csv`，逐条校验音频流数量、声道数、采样率、可用声道布局、时长差异和解码后的 PCM 哈希。
+4. 自定义参数模式由用户自己控制音频参数，脚本不会强制 `copy`。
+
+容器与元数据策略：
+
+- 默认保留输入元数据和章节。
+- 默认只重编码主视频流 `0:v:0`，避免附加封面图等视频流被误重编码。
+- MOV 输出会尽量保留数据流和附件流。
+- MP4 输出仅保留常见可封装的数据流，例如 `tmcd/gpmd/camm/mett/metx/rtmd`。
+- 探测到 metadata/data/附件等扩展流时，会自动把该文件输出为 MOV，以提高封装兼容性。
+
+## 7. 产物说明
+
+工作目录会包含：
+
+- `preflight_files.csv`：输入文件探测结果。
+- `groups_summary.csv`：分组汇总。
+- `tasks_preflight.json`：执行前任务清单和命令。
+- `tasks_result.csv`：每个任务的最终命令、日志、返回码和备注。
+- `pre_media_info.csv` / `post_media_info.csv`：转码前后主视频流信息。
+- `audio_verify.csv`：转码后音频校验结果。
+- `logs/` 或输出目录同级 `*_logs/`：逐任务 FFmpeg 日志。
+
+## 8. 故障排查
+
+- `ffmpeg-not-found`：确认 FFmpeg/FFprobe 已安装并在 `PATH` 中。
+- 硬件编码失败：先用 `--query-params` 检查编码器可用性，再确认驱动、设备映射和容器权限；脚本会自动尝试一次 CPU 回退。
+- 音频校验失败：查看 `audio_verify.csv` 的 `note` 字段以及对应任务日志。常见原因包括自定义参数重编码音频、输出容器不支持某些音频流、源文件音频探测信息异常。
+- 批量任务过慢或失败多：把 `--concurrency` 调低到 `1`，并使用 `--timeout` 防止单任务卡死。
