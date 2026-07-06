@@ -618,7 +618,7 @@ def build_ffmpeg_cmd(input_path, output_path, opts, override_tokens=None):
         bitrate = opts.get("audio_bitrate")
         base += ["-map", "0:v:0", "-map", "0:a?", "-c:a", audio_codec]
         if bitrate:
-            base += ["-b:a", bitrate]
+            base +=["-b:a", bitrate]
 
     # 视频编码
     if codec == "hevc" and encoder == "nvenc":
@@ -775,30 +775,6 @@ def move_to_error(failed_tasks, src_root):
 
 # ---------- 主函数 ----------
 def main():
-    # 双击运行检测（无命令行参数时弹出提示并保持窗口）
-    if len(sys.argv) <= 1:
-        print("=" * 60)
-        print(" transcode_hw_main - 硬件转码工具")
-        print("=" * 60)
-        print("\n请使用命令行运行，例如：")
-        print(r'  transcode_hw_main.exe --src "F:\素材" --skip')
-        print("\n常用参数：")
-        print("  --src PATH       源文件或目录（必需）")
-        print("  --dst PATH       输出目录（默认 <src>_comp）")
-        print("  --work PATH      工作目录（默认 <src>_work）")
-        print("  --skip           跳过所有交互确认")
-        print("  --grp-auto       自动按文件名前缀分组")
-        print("  --encoder TYPE   nvenc/qsv/amf（默认 nvenc）")
-        print("\n完整帮助：")
-        print("  transcode_hw_main.exe --help")
-        print("\n" + "-" * 60)
-        print(" 窗口将保持打开，请直接输入命令运行...")
-        print("-" * 60)
-        # 保持 CMD 窗口打开在当前目录，不关闭
-        import os
-        os.system("cmd /k")
-        sys.exit(0)
-
     parser = argparse.ArgumentParser(
         description="硬件转码工具 (nvenc/qsv/amf)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1093,25 +1069,30 @@ def main():
 
 
 if __name__ == "__main__":
-    # Windows 双击检测：无参数时弹出提示并保持窗口
-    if len(sys.argv) <= 1 and sys.platform == "win32":
-        print("=" * 50)
-        print(" transcode_hw_main - 硬件转码工具 \n")
-        print("=" * 50)
-        print("本程序需要在命令行中运行，不支持直接双击打开。\n")
-        print("用法示例:")
-        print('  transcode_hw_main.exe --src "F:\\素材" --skip')
-        print('  python transcode_hw_main.py --src "F:\\素材" --skip \n')
-        print("常用参数:")
-        print("  --src PATH          源文件或目录（必需）")
-        print("  --dst PATH          输出目录（默认 <src>_comp）")
-        print("  --work PATH         工作目录（默认 <src>_work）")
-        print("  --encoder nvenc     编码器 (nvenc/qsv/amf)")
-        print("  --grp-auto          自动分组")
-        print("  --skip              跳过交互确认")
-        print("  --skip-check        启用兼容性 fallback \n")
-        print("完整参数请使用: --help \n")
-        print("按 Enter 键退出...")
-        input()
+    # 统一双击/无参数检测，跨平台保持窗口
+    if len(sys.argv) <= 1:
+        print("=" * 60)
+        print(" transcode_hw_main - 硬件转码工具")
+        print("=" * 60)
+        print("\n请使用命令行运行，例如：")
+        print(r'  transcode_hw_main.exe --src "F:\素材" --skip')
+        print("\n常用参数：")
+        print("  --src PATH       源文件或目录（必需）")
+        print("  --dst PATH       输出目录（默认 <src>_comp）")
+        print("  --work PATH      工作目录（默认 <src>_work）")
+        print("  --skip           跳过所有交互确认")
+        print("  --grp-auto       自动按文件名前缀分组")
+        print("  --encoder TYPE   nvenc/qsv/amf（默认 nvenc）")
+        print("\n完整帮助：")
+        print("  transcode_hw_main.exe --help")
+        print("\n" + "-" * 60)
+        print(" 窗口将保持打开，请直接输入命令运行...")
+        print("-" * 60)
+        
+        if sys.platform == "win32":
+            os.system("cmd /k")
+        else:
+            input("按 Enter 键退出...")
         sys.exit(0)
+    
     main()
