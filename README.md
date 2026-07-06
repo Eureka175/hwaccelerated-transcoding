@@ -8,7 +8,7 @@
 
 从 [GitHub Releases](https://github.com/Eureka175/hwaccelerated-transcoding/releases/) 下载最新版本：
 
-- **Windows 分发包**: `transcode_hw_vX.X.zip`（内含 `transcode_hw_main.exe` + `ffmpeg/` + `README.md`）
+- **Windows 分发包**: `transcode_hw_vX.X.zip`（内含 `transcode_hw_main.exe` + `ffmpeg` + `README.md`）
 - 解压到任意目录即可使用，无需安装 Python 或 FFmpeg
 
 > 若首次使用，建议下载最新 Release 而非手动克隆仓库。
@@ -430,8 +430,3 @@ WARNING: 10bit 4:2:2 not supported by nvenc; using CPU decode
 
 ---
 
-## 14. 免责声明
-
-- **AMF 参数**：作者无 AMD 显卡进行实际验证，AMF 参数仅通过查阅 FFmpeg 文档及 AMD 官方资料整理，实际运行可能存在兼容性问题，欢迎 AMD 用户反馈。
-- **CPU Fallback**：`libx265` / `libx264` 的 `-preset slow` 为保守选择，速度较慢但画质稳定。
-- **分发包**：包含的 FFmpeg 为 gyan.dev 静态编译版，遵循 GPL 协议。
